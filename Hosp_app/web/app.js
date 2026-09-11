@@ -227,8 +227,8 @@ function tabsForRole(role) {
   return [
     ["approvals", "Approvals"],
     ["attendance", "Attendance"],
-    ["staff", "Staff & Salary"],
-    ["adjustments", "Balance Adjustments"],
+    ["staff", "Staff Directory"],
+    ["adjustments", "Paid Leave Adjustments"],
   ];
 }
 
@@ -408,7 +408,86 @@ async function logOvertimeQuick(staffId, staffName, dateStr, el, isOwner) {
 }
 
 function renderMarkerTab(el) { el.dataset.date = el.dataset.date || todayStr(); renderDailyAttendance(el, { isOwner: false }); }
-function renderOwnerAttendanceTab(el) { el.dataset.date = el.dataset.date || todayStr(); renderDailyAttendance(el, { isOwner: true }); }
+
+function renderOwnerAttendanceTab(el) {
+  const view = el.dataset.view || "daily";
+  el.innerHTML = `
+    <div class="subtabs">
+      <button data-view="daily" class="${view === "daily" ? "active" : ""}">Daily</button>
+      <button data-view="monthly" class="${view === "monthly" ? "active" : ""}">Monthly overview</button>
+    </div>
+    <div id="attendance-view-body"></div>
+  `;
+  $all(".subtabs button", el).forEach((btn) => {
+    btn.onclick = () => { el.dataset.view = btn.dataset.view; renderOwnerAttendanceTab(el); };
+  });
+  const body = $("#attendance-view-body", el);
+  body.dataset.date = el.dataset.date || todayStr();
+  if (view === "daily") {
+    renderDailyAttendance(body, { isOwner: true });
+  } else {
+    body.dataset.year = el.dataset.year || String(new Date().getFullYear());
+    body.dataset.month = el.dataset.month || String(new Date().getMonth() + 1);
+    renderMonthlyOverview(body, el);
+  }
+}
+
+async function renderMonthlyOverview(body, parentEl) {
+  const year = parseInt(body.dataset.year, 10);
+  const month = parseInt(body.dataset.month, 10);
+  const [start, end, lastDay] = monthRange(year, month);
+
+  body.innerHTML = `
+    <div class="card">
+      <h2>Monthly overview</h2>
+      <div class="row">
+        <div><label>Year</label><input type="number" id="mo-year" value="${year}" /></div>
+        <div><label>Month (1-12)</label><input type="number" id="mo-month" min="1" max="12" value="${month}" /></div>
+      </div>
+      <div id="mo-grid" style="overflow-x:auto; margin-top:14px;">Loading…</div>
+    </div>
+  `;
+
+  $("#mo-year").addEventListener("change", (e) => { parentEl.dataset.year = e.target.value; renderOwnerAttendanceTab(parentEl); });
+  $("#mo-month").addEventListener("change", (e) => { parentEl.dataset.month = e.target.value; renderOwnerAttendanceTab(parentEl); });
+
+  const [{ data: staffList, error: staffErr }, { data: att }] = await Promise.all([
+    sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).order("full_name"),
+    sb.from("attendance").select("staff_id, date, status").gte("date", start).lte("date", end),
+  ]);
+
+  const gridEl = $("#mo-grid", body);
+  if (staffErr) { gridEl.innerHTML = `<div class="error-text">${escapeHtml(staffErr.message)}</div>`; return; }
+  if (!staffList || staffList.length === 0) { gridEl.innerHTML = `<div class="hint-text">No active staff yet.</div>`; return; }
+
+  const byStaffDate = {};
+  (att || []).forEach((a) => { byStaffDate[a.staff_id + "|" + a.date] = a.status; });
+
+  const shortLabel = { present: "P", half_day_no_notice: "H", absent_no_notice: "A",
+    approved_paid_leave: "PL", approved_unpaid_leave: "UL",
+    half_day_approved_paid: "HPL", half_day_approved_unpaid: "HUL" };
+
+  let html = `<table style="border-collapse:collapse; font-size:11px; min-width:700px;"><thead><tr>
+    <th style="text-align:left; padding:4px 8px; position:sticky; left:0; background:#fff;">Staff</th>
+    ${Array.from({ length: lastDay }, (_, i) => `<th style="padding:4px 3px;">${i + 1}</th>`).join("")}
+    </tr></thead><tbody>`;
+
+  staffList.forEach((s) => {
+    html += `<tr><td style="padding:4px 8px; white-space:nowrap; position:sticky; left:0; background:#fff; border-right:1px solid var(--border);">${escapeHtml(s.full_name)}</td>`;
+    for (let d = 1; d <= lastDay; d++) {
+      const dStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      const status = byStaffDate[s.id + "|" + dStr];
+      const info = status ? ATTENDANCE_LABELS[status] : null;
+      const bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
+      const title = info ? info.label : "Not marked";
+      html += `<td title="${escapeHtml(title)}" style="background:${bg}; text-align:center; padding:5px 2px; border-radius:4px;">${status ? shortLabel[status] : ""}</td>`;
+    }
+    html += `</tr>`;
+  });
+  html += `</tbody></table>
+    <div class="hint-text" style="margin-top:8px;">P=Present · H=Half-day (no notice) · A=Absent (no notice) · PL=Paid Leave · UL=Unpaid Leave · HPL/HUL=Half-day leave</div>`;
+  gridEl.innerHTML = html;
+}
 
 // ============================================================================
 // STAFF: My Attendance tab (calendar + balance + salary)
@@ -605,7 +684,7 @@ async function renderApprovalsTab(el) {
 
   const { data, error } = await sb
     .from("leave_requests")
-    .select("*, profiles(full_name), leave_request_days(*)")
+    .select("*, profiles!staff_id(full_name), leave_request_days(*)")
     .eq("status", "pending")
     .order("created_at", { ascending: true });
 
@@ -654,12 +733,12 @@ async function renderApprovalsTab(el) {
 // OWNER: Staff & Salary tab
 // ============================================================================
 async function renderStaffSalaryTab(el) {
-  el.innerHTML = `<div class="card"><h2>Staff & salary</h2><div id="staff-salary-list">Loading…</div></div>`;
+  el.innerHTML = `<div class="card"><h2>Staff Directory</h2><div id="staff-salary-list">Loading…</div></div>`;
   const container = $("#staff-salary-list");
 
   const { data, error } = await sb
     .from("profiles")
-    .select("id, full_name, employee_code, department, designation, is_active, staff_salary(monthly_salary)")
+    .select("id, full_name, employee_code, department, designation, is_active, staff_salary!staff_id(monthly_salary)")
     .order("full_name");
 
   if (error) { container.innerHTML = `<div class="error-text">${escapeHtml(error.message)}</div>`; return; }
@@ -702,7 +781,7 @@ async function renderAdjustmentsTab(el) {
 
   el.innerHTML = `
     <div class="card">
-      <h2>Add a balance adjustment</h2>
+      <h2>Add a paid leave adjustment</h2>
       <label>Staff member</label>
       <select id="adj-staff">${(staffList || []).map((s) => `<option value="${s.id}">${escapeHtml(s.full_name)}</option>`).join("")}</select>
       <div class="row">
@@ -743,7 +822,7 @@ async function loadAdjustmentsList() {
   const container = $("#adj-list");
   const { data, error } = await sb
     .from("leave_balance_adjustments")
-    .select("*, profiles(full_name)")
+    .select("*, profiles!staff_id(full_name)")
     .order("created_at", { ascending: false })
     .limit(20);
   if (error) { container.innerHTML = `<div class="error-text">${escapeHtml(error.message)}</div>`; return; }
