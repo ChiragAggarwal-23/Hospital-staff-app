@@ -320,7 +320,8 @@ async function renderDailyAttendance(el, { isOwner }) {
     let actions = "";
     if (canEdit) {
       actions = `
-        <div class="action-group" data-staff="${s.id}" data-name="${escapeHtml(s.full_name)}">
+        <div class="action-group" data-staff="${s.id}" data-name="${escapeHtml(s.full_name)}" data-locked="${locked ? "1" : ""}">
+          ${locked ? `<div class="hint-text" style="margin-bottom:4px;">Any action below will cancel the approved leave on this date and restore the balance.</div>` : ""}
           <button class="btn btn-outline btn-small act-present">Present</button>
           <button class="btn btn-outline btn-small act-half-notice">Half-day (No notice)</button>
           <button class="btn btn-outline btn-small act-absent">Absent (No notice)</button>
@@ -346,25 +347,49 @@ async function renderDailyAttendance(el, { isOwner }) {
   $all(".action-group", listEl).forEach((grp) => {
     const staffId = grp.dataset.staff;
     const staffName = grp.dataset.name;
-    $(".act-present", grp).onclick = () => markSimpleAttendance(staffId, "present", dateStr, el, isOwner);
-    $(".act-half-notice", grp).onclick = () => markSimpleAttendance(staffId, "half_day_no_notice", dateStr, el, isOwner);
-    $(".act-absent", grp).onclick = () => markSimpleAttendance(staffId, "absent_no_notice", dateStr, el, isOwner);
-    $(".act-paid", grp).onclick = () => logLeaveQuick(staffId, staffName, dateStr, "paid", isOwner, el);
-    $(".act-unpaid", grp).onclick = () => logLeaveQuick(staffId, staffName, dateStr, "unpaid", isOwner, el);
-    $(".act-overtime", grp).onclick = () => logOvertimeQuick(staffId, staffName, dateStr, el, isOwner);
+    const wasLocked = grp.dataset.locked === "1";
+    $(".act-present", grp).onclick = () => markSimpleAttendance(staffId, "present", dateStr, el, isOwner, wasLocked);
+    $(".act-half-notice", grp).onclick = () => markSimpleAttendance(staffId, "half_day_no_notice", dateStr, el, isOwner, wasLocked);
+    $(".act-absent", grp).onclick = () => markSimpleAttendance(staffId, "absent_no_notice", dateStr, el, isOwner, wasLocked);
+    $(".act-paid", grp).onclick = () => logLeaveQuick(staffId, staffName, dateStr, "paid", isOwner, el, wasLocked);
+    $(".act-unpaid", grp).onclick = () => logLeaveQuick(staffId, staffName, dateStr, "unpaid", isOwner, el, wasLocked);
+    $(".act-overtime", grp).onclick = () => logOvertimeQuick(staffId, staffName, dateStr, el, isOwner, wasLocked);
   });
 }
 
-async function markSimpleAttendance(staffId, status, dateStr, el, isOwner) {
+// When the owner overrides a date that's currently locked by an approved
+// leave day, cancel that leave day first: this restores the staff's paid
+// leave balance (if it was paid) and unlocks the date, via the same
+// trigger path used for ordinary leave cancellation. Marker never reaches
+// here -- locked dates aren't editable by marker at all (see `canEdit`).
+async function cancelLockedLeaveDay(staffId, dateStr) {
+  const { error } = await sb
+    .from("leave_request_days")
+    .update({ day_status: "cancelled" })
+    .eq("staff_id", staffId)
+    .eq("date", dateStr)
+    .eq("day_status", "active");
+  if (error) {
+    alert("Couldn't clear the existing approved leave for this date: " + error.message);
+    return false;
+  }
+  return true;
+}
+
+async function markSimpleAttendance(staffId, status, dateStr, el, isOwner, wasLocked) {
+  if (wasLocked) {
+    const ok = await cancelLockedLeaveDay(staffId, dateStr);
+    if (!ok) return;
+  }
   const { error } = await sb.from("attendance").upsert(
-    { staff_id: staffId, date: dateStr, status, marked_by: profile.id },
+    { staff_id: staffId, date: dateStr, status, marked_by: profile.id, locked_by_leave: false },
     { onConflict: "staff_id,date" }
   );
   if (error) { alert("Couldn't save: " + error.message); return; }
   renderDailyAttendance(el, { isOwner });
 }
 
-async function logLeaveQuick(staffId, staffName, dateStr, type, isOwner, el) {
+async function logLeaveQuick(staffId, staffName, dateStr, type, isOwner, el, wasLocked) {
   const result = await openModal(`Log ${type === "paid" ? "Paid" : "Unpaid"} Leave — ${staffName}`, `
     <label>Portion</label>
     <select name="portion">
@@ -375,6 +400,11 @@ async function logLeaveQuick(staffId, staffName, dateStr, type, isOwner, el) {
     <textarea name="reason" required placeholder="e.g. informed verbally, on-the-spot approval"></textarea>
   `);
   if (!result) return;
+
+  if (wasLocked) {
+    const ok = await cancelLockedLeaveDay(staffId, dateStr);
+    if (!ok) return;
+  }
 
   const { error } = await sb.from("leave_requests").insert({
     staff_id: staffId,
@@ -392,13 +422,17 @@ async function logLeaveQuick(staffId, staffName, dateStr, type, isOwner, el) {
   renderDailyAttendance(el, { isOwner });
 }
 
-async function logOvertimeQuick(staffId, staffName, dateStr, el, isOwner) {
+async function logOvertimeQuick(staffId, staffName, dateStr, el, isOwner, wasLocked) {
   const result = await openModal(`Log Overtime — ${staffName}`, `
     <p class="hint-text">Logs a half-day overtime credit for ${escapeHtml(dateStr)}.</p>
     <label>Note (optional)</label>
     <textarea name="reason" placeholder="optional note"></textarea>
   `);
   if (!result) return;
+  if (wasLocked) {
+    const ok = await cancelLockedLeaveDay(staffId, dateStr);
+    if (!ok) return;
+  }
   const { error } = await sb.from("overtime_credits").upsert(
     { staff_id: staffId, date: dateStr, reason: result.reason || null, recorded_by: profile.id },
     { onConflict: "staff_id,date" }
@@ -494,9 +528,12 @@ async function renderMonthlyOverview(body, parentEl) {
 // ============================================================================
 async function renderMyAttendanceTab(el) {
   const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth() + 1;
-  const [start, end] = monthRange(year, month);
+  let year = parseInt(el.dataset.year || now.getFullYear(), 10);
+  let month = parseInt(el.dataset.month || now.getMonth() + 1, 10);
+  el.dataset.year = year;
+  el.dataset.month = month;
+
+  const [start, end, lastDay] = monthRange(year, month);
 
   const [{ data: att }, { data: salary }, { data: balance, error: balErr }] = await Promise.all([
     sb.from("attendance").select("date, status").eq("staff_id", profile.id).gte("date", start).lte("date", end),
@@ -505,8 +542,8 @@ async function renderMyAttendanceTab(el) {
   ]);
 
   const attByDate = Object.fromEntries((att || []).map((a) => [a.date, a.status]));
-  const [, , lastDay] = monthRange(year, month);
   const firstWeekday = new Date(year, month - 1, 1).getDay();
+  const monthLabel = new Date(year, month - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
 
   let cells = "";
   for (let i = 0; i < firstWeekday; i++) cells += `<div></div>`;
@@ -526,15 +563,32 @@ async function renderMyAttendanceTab(el) {
       <h2>My monthly salary</h2>
       <div class="summary-tiles">
         <div class="tile"><div class="num">${salary?.monthly_salary != null ? money(salary.monthly_salary) : "—"}</div><div class="lbl">Monthly salary</div></div>
-        <div class="tile"><div class="num">${balErr ? "—" : Number(balance).toFixed(1)}</div><div class="lbl">Paid leave balance (this month)</div></div>
+        <div class="tile"><div class="num">${balErr ? "—" : Number(balance).toFixed(1)}</div><div class="lbl">Paid leave balance (${monthLabel})</div></div>
       </div>
       ${balErr ? `<div class="error-text">${escapeHtml(balErr.message)}</div>` : ""}
     </div>
     <div class="card">
-      <h2>${now.toLocaleDateString(undefined, { month: "long", year: "numeric" })}</h2>
+      <div class="staff-row" style="border-bottom:none; padding-top:0;">
+        <button class="btn btn-outline btn-small" id="prev-month">&larr; Prev</button>
+        <h2 style="margin:0;">${monthLabel}</h2>
+        <button class="btn btn-outline btn-small" id="next-month">Next &rarr;</button>
+      </div>
       <div class="calendar-grid">${cells}</div>
     </div>
   `;
+
+  $("#prev-month", el).onclick = () => {
+    let m = month - 1, y = year;
+    if (m < 1) { m = 12; y -= 1; }
+    el.dataset.year = y; el.dataset.month = m;
+    renderMyAttendanceTab(el);
+  };
+  $("#next-month", el).onclick = () => {
+    let m = month + 1, y = year;
+    if (m > 12) { m = 1; y += 1; }
+    el.dataset.year = y; el.dataset.month = m;
+    renderMyAttendanceTab(el);
+  };
 }
 
 function cssVarFromClass(cls) {
@@ -692,28 +746,52 @@ async function renderApprovalsTab(el) {
   if (!data || data.length === 0) { container.innerHTML = `<div class="hint-text">Nothing waiting on you right now.</div>`; return; }
 
   container.innerHTML = data.map((r) => {
-    const days = (r.leave_request_days || []).sort((a, b) => a.date.localeCompare(b.date));
+    const days = (r.leave_request_days || []).filter((d) => d.day_status === "active").sort((a, b) => a.date.localeCompare(b.date));
     return `
-      <div class="request-item">
+      <div class="request-item" data-req-id="${r.id}">
         <div class="request-head">
           <div><strong>${escapeHtml(r.profiles?.full_name || "Unknown")}</strong> —
             ${fmtDateNice(r.from_date)}${r.to_date !== r.from_date ? " – " + fmtDateNice(r.to_date) : ""}</div>
         </div>
         <div class="hint-text">${escapeHtml(r.reason)}</div>
+        ${days.length > 1 ? `<div class="hint-text">Untick any date you don't want to approve — the paid/unpaid split for the remaining dates is recalculated against the balance automatically.</div>` : ""}
         ${days.map((d) => { const b = leaveDayBadge(d.day_portion, d.type); return `
-          <div class="day-line"><span>${fmtDateNice(d.date)}</span><span class="badge ${b.cls}">${b.label}</span></div>`; }).join("")}
+          <div class="day-line">
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+              <input type="checkbox" class="day-check" data-day-id="${d.id}" checked />
+              <span>${fmtDateNice(d.date)}</span>
+            </label>
+            <span class="badge ${b.cls}">${b.label}</span>
+          </div>`; }).join("")}
         <div style="margin-top:10px;">
-          <button class="btn btn-primary btn-small act-approve" data-id="${r.id}">Approve</button>
-          <button class="btn btn-danger btn-small act-reject" data-id="${r.id}">Reject</button>
+          <button class="btn btn-primary btn-small act-approve" data-id="${r.id}">Approve selected dates</button>
+          <button class="btn btn-danger btn-small act-reject" data-id="${r.id}">Reject entire request</button>
         </div>
       </div>`;
   }).join("");
 
   $all(".act-approve", container).forEach((btn) => {
     btn.onclick = async () => {
+      const reqId = btn.dataset.id;
+      const item = btn.closest(".request-item");
+      const checks = $all(".day-check", item);
+      const uncheckedIds = checks.filter((c) => !c.checked).map((c) => c.dataset.dayId);
+      const checkedCount = checks.length - uncheckedIds.length;
+      if (checkedCount === 0) {
+        alert('At least one date must stay checked to approve. Use "Reject entire request" if none of these dates should be approved.');
+        return;
+      }
+      if (uncheckedIds.length > 0) {
+        const { error: cancelErr } = await sb
+          .from("leave_request_days")
+          .update({ day_status: "cancelled" })
+          .in("id", uncheckedIds)
+          .eq("day_status", "active");
+        if (cancelErr) { alert("Couldn't update the excluded dates: " + cancelErr.message); return; }
+      }
       const { error } = await sb.from("leave_requests").update({
         status: "approved", reviewed_by: profile.id, reviewed_at: new Date().toISOString(),
-      }).eq("id", btn.dataset.id);
+      }).eq("id", reqId);
       if (error) { alert("Couldn't approve: " + error.message); return; }
       renderApprovalsTab(el);
     };

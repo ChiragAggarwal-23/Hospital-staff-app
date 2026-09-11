@@ -1,6 +1,6 @@
 :root {
-  --green: #52746b;
-  --green-dark: #3c5750;
+  --green: #1d6f5c;
+  --green-dark: #124a3d;
   --bg: #f6f7f6;
   --card: #ffffff;
   --border: #e5e8e6;
@@ -34,10 +34,9 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: var(--card);
-  color: var(--text);
+  background: var(--green);
+  color: #f5f8f6;
   padding: 14px 18px;
-  border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
   z-index: 10;
@@ -47,50 +46,49 @@ body {
   font-size: 16px;
   margin: 0;
   font-weight: 600;
-  color: var(--green-dark);
+  color: #ffffff;
 }
 
 .topbar .who {
   font-size: 12.5px;
-  color: var(--text-dim);
+  color: #e6efea;
 }
 
 .topbar button {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
+  background: rgba(255,255,255,0.14);
+  border: 1px solid rgba(255,255,255,0.3);
+  color: #f5f8f6;
   padding: 7px 12px;
   border-radius: 8px;
   font-size: 13px;
   cursor: pointer;
 }
-.topbar button:hover { border-color: var(--green); color: var(--green-dark); }
+.topbar button:hover { background: rgba(255,255,255,0.24); }
 
 .tabs {
   display: flex;
   gap: 2px;
-  padding: 0 14px;
-  background: var(--card);
-  border-bottom: 1px solid var(--border);
+  padding: 8px 12px 0;
+  background: var(--green);
   overflow-x: auto;
 }
 
 .tabs button {
-  background: transparent;
+  background: rgba(255,255,255,0.10);
   border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--text-dim);
-  padding: 11px 12px;
+  border-radius: 8px 8px 0 0;
+  color: #eaf1ee;
+  padding: 10px 14px;
   font-size: 13px;
   cursor: pointer;
   white-space: nowrap;
 }
 
-.tabs button:hover { color: var(--text); }
+.tabs button:hover { background: rgba(255,255,255,0.18); }
 
 .tabs button.active {
+  background: var(--bg);
   color: var(--green-dark);
-  border-bottom-color: var(--green);
   font-weight: 600;
 }
 
@@ -255,6 +253,7 @@ textarea { min-height: 60px; resize: vertical; }
   gap: 6px;
   flex-wrap: wrap;
 }
+.day-line label { white-space: nowrap; }
 
 .login-wrap {
   min-height: 100vh;
