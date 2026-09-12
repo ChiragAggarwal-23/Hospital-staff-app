@@ -86,7 +86,7 @@ function leaveDayBadge(portion, type) {
 // Generic modal (used for: marker/owner logging a leave, owner's balance
 // adjustment, staff's leave request form)
 // ----------------------------------------------------------------------------
-function openModal(title, bodyHtml) {
+function openModal(title, bodyHtml, submitLabel = "Save") {
   return new Promise((resolve) => {
     const wrap = document.createElement("div");
     wrap.className = "modal-backdrop";
@@ -97,7 +97,7 @@ function openModal(title, bodyHtml) {
         <div class="error-text" id="modal-error" style="display:none"></div>
         <div class="modal-actions">
           <button type="button" class="btn btn-outline" id="modal-cancel">Cancel</button>
-          <button type="submit" form="modal-form" class="btn btn-primary" id="modal-submit">Save</button>
+          <button type="submit" form="modal-form" class="btn btn-primary" id="modal-submit">${escapeHtml(submitLabel)}</button>
         </div>
       </div>`;
     document.body.appendChild(wrap);
@@ -120,6 +120,22 @@ function openModal(title, bodyHtml) {
 function modalError(msg) {
   const el = $("#modal-error");
   if (el) { el.textContent = msg; el.style.display = "block"; }
+}
+
+// A styled Yes/No confirmation, built on the same modal used everywhere
+// else. Resolves true if the person confirmed, false if they backed out.
+function confirmAction(message, submitLabel = "Yes, continue") {
+  return openModal("Please confirm", `<p style="margin:0;">${escapeHtml(message)}</p>`, submitLabel)
+    .then((r) => r !== null);
+}
+
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
+
+function monthSelectHtml(id, selectedMonth) {
+  return `<select id="${id}">${MONTH_NAMES.map((name, i) =>
+    `<option value="${i + 1}" ${i + 1 === selectedMonth ? "selected" : ""}>${name}</option>`
+  ).join("")}</select>`;
 }
 
 // inject minimal modal CSS once
@@ -222,12 +238,13 @@ async function logout() {
 // Shell: topbar + tabs + tab content
 // ----------------------------------------------------------------------------
 function tabsForRole(role) {
-  if (role === "marker") return [["mark", "Mark Attendance"]];
+  if (role === "marker") return [["mark", "Mark Attendance"], ["monthly", "Monthly Overview"]];
   if (role === "staff") return [["my-attendance", "My Attendance"], ["leave", "Leave Requests"]];
   return [
     ["approvals", "Approvals"],
     ["attendance", "Attendance"],
     ["staff", "Staff Directory"],
+    ["payroll", "Payroll"],
     ["adjustments", "Paid Leave Adjustments"],
   ];
 }
@@ -264,11 +281,13 @@ function renderTabContent() {
   const el = $("#tab-content");
   el.innerHTML = `<div class="card">Loading…</div>`;
   if (activeTab === "mark") return renderMarkerTab(el);
+  if (activeTab === "monthly") return renderMarkerMonthlyTab(el);
   if (activeTab === "my-attendance") return renderMyAttendanceTab(el);
   if (activeTab === "leave") return renderMyLeaveTab(el);
   if (activeTab === "approvals") return renderApprovalsTab(el);
   if (activeTab === "attendance") return renderOwnerAttendanceTab(el);
   if (activeTab === "staff") return renderStaffSalaryTab(el);
+  if (activeTab === "payroll") return renderPayrollTab(el);
   if (activeTab === "adjustments") return renderAdjustmentsTab(el);
 }
 
@@ -292,10 +311,11 @@ async function renderDailyAttendance(el, { isOwner }) {
     renderDailyAttendance(el, { isOwner });
   });
 
-  const [{ data: staffList, error: staffErr }, { data: attendance }, { data: leaveDays }] = await Promise.all([
+  const [{ data: staffList, error: staffErr }, { data: attendance }, { data: leaveDays }, { data: overtimeRows }] = await Promise.all([
     sb.from("profiles").select("id, full_name, employee_code").eq("role", "staff").eq("is_active", true).order("full_name"),
     sb.from("attendance").select("staff_id, status").eq("date", dateStr),
     sb.from("leave_request_days").select("staff_id, day_portion, type").eq("date", dateStr).eq("day_status", "active"),
+    sb.from("overtime_credits").select("staff_id, day_portion").eq("date", dateStr),
   ]);
 
   const listEl = $("#staff-list", el);
@@ -303,10 +323,13 @@ async function renderDailyAttendance(el, { isOwner }) {
 
   const attByStaff = Object.fromEntries((attendance || []).map((a) => [a.staff_id, a.status]));
   const leaveByStaff = Object.fromEntries((leaveDays || []).map((l) => [l.staff_id, l]));
+  const overtimeByStaff = Object.fromEntries((overtimeRows || []).map((o) => [o.staff_id, o]));
+  const isFutureOrToday = dateStr >= todayStr();
 
   listEl.innerHTML = (staffList || []).map((s) => {
     const locked = leaveByStaff[s.id];
     const currentStatus = attByStaff[s.id];
+    const overtime = overtimeByStaff[s.id];
     let badgeHtml = `<span class="badge badge-none">Not marked</span>`;
     if (locked) {
       const b = leaveDayBadge(locked.day_portion, locked.type);
@@ -315,8 +338,13 @@ async function renderDailyAttendance(el, { isOwner }) {
       const b = ATTENDANCE_LABELS[currentStatus];
       badgeHtml = `<span class="badge ${b.cls}">${b.label}</span>`;
     }
+    if (overtime) {
+      badgeHtml += ` <span class="badge badge-overtime">Overtime${overtime.day_portion === "full" ? " (Full)" : ""}</span>`;
+    }
 
     const canEdit = !locked || isOwner;
+    const showOvertimeBtn = !locked && currentStatus === "present" && !overtime;
+    const showUnmarkBtn = isOwner && locked && isFutureOrToday;
     let actions = "";
     if (canEdit) {
       actions = `
@@ -327,7 +355,8 @@ async function renderDailyAttendance(el, { isOwner }) {
           <button class="btn btn-outline btn-small act-absent">Absent (No notice)</button>
           <button class="btn btn-outline btn-small act-paid">Log Paid Leave</button>
           <button class="btn btn-outline btn-small act-unpaid">Log Unpaid Leave</button>
-          <button class="btn btn-outline btn-small act-overtime">Log Overtime</button>
+          ${showOvertimeBtn ? `<button class="btn btn-outline btn-small act-overtime">Log Overtime</button>` : ""}
+          ${showUnmarkBtn ? `<button class="btn btn-outline btn-small act-unmark">Cancel leave (leave unmarked)</button>` : ""}
         </div>`;
     }
 
@@ -348,13 +377,43 @@ async function renderDailyAttendance(el, { isOwner }) {
     const staffId = grp.dataset.staff;
     const staffName = grp.dataset.name;
     const wasLocked = grp.dataset.locked === "1";
-    $(".act-present", grp).onclick = () => markSimpleAttendance(staffId, "present", dateStr, el, isOwner, wasLocked);
-    $(".act-half-notice", grp).onclick = () => markSimpleAttendance(staffId, "half_day_no_notice", dateStr, el, isOwner, wasLocked);
-    $(".act-absent", grp).onclick = () => markSimpleAttendance(staffId, "absent_no_notice", dateStr, el, isOwner, wasLocked);
-    $(".act-paid", grp).onclick = () => logLeaveQuick(staffId, staffName, dateStr, "paid", isOwner, el, wasLocked);
-    $(".act-unpaid", grp).onclick = () => logLeaveQuick(staffId, staffName, dateStr, "unpaid", isOwner, el, wasLocked);
-    $(".act-overtime", grp).onclick = () => logOvertimeQuick(staffId, staffName, dateStr, el, isOwner, wasLocked);
+    const btn = (sel) => $(sel, grp);
+    if (btn(".act-present")) btn(".act-present").onclick = () => confirmedMarkAttendance(staffId, staffName, "present", dateStr, el, isOwner, wasLocked);
+    if (btn(".act-half-notice")) btn(".act-half-notice").onclick = () => confirmedMarkAttendance(staffId, staffName, "half_day_no_notice", dateStr, el, isOwner, wasLocked);
+    if (btn(".act-absent")) btn(".act-absent").onclick = () => confirmedMarkAttendance(staffId, staffName, "absent_no_notice", dateStr, el, isOwner, wasLocked);
+    if (btn(".act-paid")) btn(".act-paid").onclick = () => confirmedLogLeave(staffId, staffName, dateStr, "paid", isOwner, el, wasLocked);
+    if (btn(".act-unpaid")) btn(".act-unpaid").onclick = () => confirmedLogLeave(staffId, staffName, dateStr, "unpaid", isOwner, el, wasLocked);
+    if (btn(".act-overtime")) btn(".act-overtime").onclick = () => logOvertimeQuick(staffId, staffName, dateStr, el, isOwner);
+    if (btn(".act-unmark")) btn(".act-unmark").onclick = () => confirmedCancelUnmark(staffId, staffName, dateStr, el, isOwner);
   });
+}
+
+// Wrap the override actions with a confirmation whenever they'd be
+// cancelling an existing approved leave (misclick protection) -- routine
+// marking on an already-open date proceeds straight through, unchanged.
+async function confirmedMarkAttendance(staffId, staffName, status, dateStr, el, isOwner, wasLocked) {
+  if (wasLocked) {
+    const label = ATTENDANCE_LABELS[status].label;
+    const ok = await confirmAction(`This will cancel ${staffName}'s approved leave on ${fmtDateNice(dateStr)} and mark them "${label}" instead. Continue?`);
+    if (!ok) return;
+  }
+  await markSimpleAttendance(staffId, status, dateStr, el, isOwner, wasLocked);
+}
+
+async function confirmedLogLeave(staffId, staffName, dateStr, type, isOwner, el, wasLocked) {
+  if (wasLocked) {
+    const ok = await confirmAction(`This will cancel ${staffName}'s existing approved leave on ${fmtDateNice(dateStr)} and log a new ${type} leave instead. Continue?`);
+    if (!ok) return;
+  }
+  await logLeaveQuick(staffId, staffName, dateStr, type, isOwner, el, wasLocked);
+}
+
+async function confirmedCancelUnmark(staffId, staffName, dateStr, el, isOwner) {
+  const ok = await confirmAction(`This will cancel ${staffName}'s approved leave on ${fmtDateNice(dateStr)} and leave the day unmarked. Continue?`);
+  if (!ok) return;
+  const done = await cancelLockedLeaveDay(staffId, dateStr);
+  if (!done) return;
+  renderDailyAttendance(el, { isOwner });
 }
 
 // When the owner overrides a date that's currently locked by an approved
@@ -422,26 +481,28 @@ async function logLeaveQuick(staffId, staffName, dateStr, type, isOwner, el, was
   renderDailyAttendance(el, { isOwner });
 }
 
-async function logOvertimeQuick(staffId, staffName, dateStr, el, isOwner, wasLocked) {
+async function logOvertimeQuick(staffId, staffName, dateStr, el, isOwner) {
   const result = await openModal(`Log Overtime — ${staffName}`, `
-    <p class="hint-text">Logs a half-day overtime credit for ${escapeHtml(dateStr)}.</p>
+    <p class="hint-text">Logs a half-day overtime credit for ${escapeHtml(dateStr)} (on top of the full day already worked). Adds 0.5 to this month's paid-leave balance.</p>
     <label>Note (optional)</label>
     <textarea name="reason" placeholder="optional note"></textarea>
   `);
   if (!result) return;
-  if (wasLocked) {
-    const ok = await cancelLockedLeaveDay(staffId, dateStr);
-    if (!ok) return;
-  }
   const { error } = await sb.from("overtime_credits").upsert(
-    { staff_id: staffId, date: dateStr, reason: result.reason || null, recorded_by: profile.id },
+    { staff_id: staffId, date: dateStr, day_portion: "half", reason: result.reason || null, recorded_by: profile.id },
     { onConflict: "staff_id,date" }
   );
   if (error) { alert("Couldn't save: " + error.message); return; }
-  alert("Overtime logged.");
+  renderDailyAttendance(el, { isOwner });
 }
 
 function renderMarkerTab(el) { el.dataset.date = el.dataset.date || todayStr(); renderDailyAttendance(el, { isOwner: false }); }
+
+function renderMarkerMonthlyTab(el) {
+  el.dataset.year = el.dataset.year || String(new Date().getFullYear());
+  el.dataset.month = el.dataset.month || String(new Date().getMonth() + 1);
+  renderMonthlyOverview(el, el, { salaryAccess: "none" });
+}
 
 function renderOwnerAttendanceTab(el) {
   const view = el.dataset.view || "daily";
@@ -462,11 +523,27 @@ function renderOwnerAttendanceTab(el) {
   } else {
     body.dataset.year = el.dataset.year || String(new Date().getFullYear());
     body.dataset.month = el.dataset.month || String(new Date().getMonth() + 1);
-    renderMonthlyOverview(body, el);
+    renderMonthlyOverview(body, el, { salaryAccess: "owner" });
   }
 }
 
-async function renderMonthlyOverview(body, parentEl) {
+async function renderMonthlyOverview(body, parentEl, opts = {}) {
+  const salaryAccess = opts.salaryAccess || "owner";
+
+  // Drilled into one staff member's own calendar -- render that instead of the grid.
+  if (body.dataset.drillStaff) {
+    return renderPersonalCalendar(body, {
+      staffId: body.dataset.drillStaff,
+      staffName: body.dataset.drillStaffName,
+      salaryAccess,
+      onBack: () => {
+        delete body.dataset.drillStaff;
+        delete body.dataset.drillStaffName;
+        renderMonthlyOverview(body, parentEl, opts);
+      },
+    });
+  }
+
   const year = parseInt(body.dataset.year, 10);
   const month = parseInt(body.dataset.month, 10);
   const [start, end, lastDay] = monthRange(year, month);
@@ -475,19 +552,22 @@ async function renderMonthlyOverview(body, parentEl) {
     <div class="card">
       <h2>Monthly overview</h2>
       <div class="row">
+        <div><label>Month</label>${monthSelectHtml("mo-month", month)}</div>
         <div><label>Year</label><input type="number" id="mo-year" value="${year}" /></div>
-        <div><label>Month (1-12)</label><input type="number" id="mo-month" min="1" max="12" value="${month}" /></div>
       </div>
+      <div class="hint-text" style="margin-top:6px;">Click a staff member's name to see their personal calendar.</div>
       <div id="mo-grid" style="overflow-x:auto; margin-top:14px;">Loading…</div>
     </div>
   `;
 
-  $("#mo-year").addEventListener("change", (e) => { parentEl.dataset.year = e.target.value; renderOwnerAttendanceTab(parentEl); });
-  $("#mo-month").addEventListener("change", (e) => { parentEl.dataset.month = e.target.value; renderOwnerAttendanceTab(parentEl); });
+  const rerender = () => { body.dataset.year = $("#mo-year", body).value; body.dataset.month = $("#mo-month", body).value; parentEl.dataset.year = body.dataset.year; parentEl.dataset.month = body.dataset.month; renderMonthlyOverview(body, parentEl, opts); };
+  $("#mo-year", body).addEventListener("change", rerender);
+  $("#mo-month", body).addEventListener("change", rerender);
 
-  const [{ data: staffList, error: staffErr }, { data: att }] = await Promise.all([
+  const [{ data: staffList, error: staffErr }, { data: att }, { data: otRows }] = await Promise.all([
     sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).order("full_name"),
     sb.from("attendance").select("staff_id, date, status").gte("date", start).lte("date", end),
+    sb.from("overtime_credits").select("staff_id, date").gte("date", start).lte("date", end),
   ]);
 
   const gridEl = $("#mo-grid", body);
@@ -496,6 +576,7 @@ async function renderMonthlyOverview(body, parentEl) {
 
   const byStaffDate = {};
   (att || []).forEach((a) => { byStaffDate[a.staff_id + "|" + a.date] = a.status; });
+  const otSet = new Set((otRows || []).map((o) => o.staff_id + "|" + o.date));
 
   const shortLabel = { present: "P", half_day_no_notice: "H", absent_no_notice: "A",
     approved_paid_leave: "PL", approved_unpaid_leave: "UL",
@@ -507,26 +588,43 @@ async function renderMonthlyOverview(body, parentEl) {
     </tr></thead><tbody>`;
 
   staffList.forEach((s) => {
-    html += `<tr><td style="padding:4px 8px; white-space:nowrap; position:sticky; left:0; background:#fff; border-right:1px solid var(--border);">${escapeHtml(s.full_name)}</td>`;
+    html += `<tr><td class="mo-staff-name" data-staff-id="${s.id}" data-staff-name="${escapeHtml(s.full_name)}"
+      style="padding:4px 8px; white-space:nowrap; position:sticky; left:0; background:#fff; border-right:1px solid var(--border); cursor:pointer; color:var(--green-dark); text-decoration:underline;">${escapeHtml(s.full_name)}</td>`;
     for (let d = 1; d <= lastDay; d++) {
       const dStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
       const status = byStaffDate[s.id + "|" + dStr];
       const info = status ? ATTENDANCE_LABELS[status] : null;
       const bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
-      const title = info ? info.label : "Not marked";
-      html += `<td title="${escapeHtml(title)}" style="background:${bg}; text-align:center; padding:5px 2px; border-radius:4px;">${status ? shortLabel[status] : ""}</td>`;
+      const hasOt = otSet.has(s.id + "|" + dStr);
+      const title = (info ? info.label : "Not marked") + (hasOt ? " + Overtime" : "");
+      html += `<td title="${escapeHtml(title)}" style="background:${bg}; text-align:center; padding:5px 2px; border-radius:4px;">${status ? shortLabel[status] : ""}${hasOt ? `<sup style="color:#8a5a00;">OT</sup>` : ""}</td>`;
     }
     html += `</tr>`;
   });
   html += `</tbody></table>
-    <div class="hint-text" style="margin-top:8px;">P=Present · H=Half-day (no notice) · A=Absent (no notice) · PL=Paid Leave · UL=Unpaid Leave · HPL/HUL=Half-day leave</div>`;
+    <div class="hint-text" style="margin-top:8px;">P=Present · H=Half-day (no notice) · A=Absent (no notice) · PL=Paid Leave · UL=Unpaid Leave · HPL/HUL=Half-day leave · OT=Overtime logged</div>`;
   gridEl.innerHTML = html;
+
+  $all(".mo-staff-name", gridEl).forEach((td) => {
+    td.onclick = () => {
+      body.dataset.drillStaff = td.dataset.staffId;
+      body.dataset.drillStaffName = td.dataset.staffName;
+      renderMonthlyOverview(body, parentEl, opts);
+    };
+  });
 }
 
 // ============================================================================
-// STAFF: My Attendance tab (calendar + balance + salary)
+// Shared: one staff member's personal calendar (used by the staff role for
+// their own "My Attendance" tab, and by owner/marker drilling into someone
+// else's month from the Monthly Overview grid).
+//   salaryAccess: "self"  -- staff viewing their own (salary only once the
+//                             viewed month has fully ended)
+//                 "owner" -- owner viewing anyone (always, balance shown too)
+//                 "none"  -- marker viewing someone else (no salary, no
+//                             balance -- only attendance + effective days)
 // ============================================================================
-async function renderMyAttendanceTab(el) {
+async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, onBack }) {
   const now = new Date();
   let year = parseInt(el.dataset.year || now.getFullYear(), 10);
   let month = parseInt(el.dataset.month || now.getMonth() + 1, 10);
@@ -534,16 +632,33 @@ async function renderMyAttendanceTab(el) {
   el.dataset.month = month;
 
   const [start, end, lastDay] = monthRange(year, month);
+  const monthComplete = end < todayStr();
+  const showSalary = salaryAccess === "owner" || (salaryAccess === "self" && monthComplete);
+  const showBalance = salaryAccess !== "none";
 
-  const [{ data: att }, { data: salary }, { data: balance, error: balErr }] = await Promise.all([
-    sb.from("attendance").select("date, status").eq("staff_id", profile.id).gte("date", start).lte("date", end),
-    sb.from("staff_salary").select("monthly_salary").eq("staff_id", profile.id).maybeSingle(),
-    sb.rpc("staff_paid_leave_balance", { p_staff_id: profile.id, p_year: year, p_month: month }),
+  const [{ data: att }, { data: otRows }, { data: effRows, error: effErr }] = await Promise.all([
+    sb.from("attendance").select("date, status").eq("staff_id", staffId).gte("date", start).lte("date", end),
+    sb.from("overtime_credits").select("date, day_portion").eq("staff_id", staffId).gte("date", start).lte("date", end),
+    sb.rpc("effective_working_days", { p_staff_id: staffId, p_year: year, p_month: month }),
   ]);
 
+  let balance = null, balErr = null;
+  if (showBalance) {
+    const balRes = await sb.rpc("staff_paid_leave_balance", { p_staff_id: staffId, p_year: year, p_month: month });
+    balance = balRes.data; balErr = balRes.error;
+  }
+
+  let salaryText = null;
+  if (showSalary) {
+    const salRes = await sb.rpc("calculate_salary", { p_staff_id: staffId, p_year: year, p_month: month });
+    salaryText = salRes.error ? "—" : money(salRes.data);
+  }
+
   const attByDate = Object.fromEntries((att || []).map((a) => [a.date, a.status]));
+  const otByDate = Object.fromEntries((otRows || []).map((o) => [o.date, o]));
   const firstWeekday = new Date(year, month - 1, 1).getDay();
   const monthLabel = new Date(year, month - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  const eff = (effRows && effRows[0]) || {};
 
   let cells = "";
   for (let i = 0; i < firstWeekday; i++) cells += `<div></div>`;
@@ -552,22 +667,38 @@ async function renderMyAttendanceTab(el) {
     const status = attByDate[dStr];
     const info = status ? ATTENDANCE_LABELS[status] : null;
     const bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
+    const ot = otByDate[dStr];
     cells += `<div class="cal-cell" style="background:${bg}">
       <div class="cal-daynum">${d}</div>
       <div class="cal-label">${info ? info.label : ""}</div>
+      ${ot ? `<div class="cal-label" style="color:#8a5a00;">OT${ot.day_portion === "full" ? " (Full)" : ""}</div>` : ""}
     </div>`;
   }
 
+  const salaryTileHtml = salaryAccess === "none" ? "" : showSalary
+    ? `<div class="tile"><div class="num">${salaryText}</div><div class="lbl">Calculated salary (${monthLabel})</div></div>`
+    : `<div class="tile"><div class="num">—</div><div class="lbl">Salary (available after ${monthLabel} ends)</div></div>`;
+  const balanceTileHtml = showBalance
+    ? `<div class="tile"><div class="num">${balErr ? "—" : Number(balance).toFixed(2)}</div><div class="lbl">Paid leave balance</div></div>` : "";
+  const effTileHtml = `<div class="tile"><div class="num">${effErr ? "—" : Number(eff.effective_days ?? 0).toFixed(2)}</div><div class="lbl">Effective working days</div></div>`;
+
   el.innerHTML = `
+    ${onBack ? `<button class="btn btn-outline btn-small" id="cal-back" style="margin-bottom:10px;">&larr; Back to overview</button>` : ""}
     <div class="card">
-      <h2>My monthly salary</h2>
+      <h2>${staffName ? escapeHtml(staffName) + "'s attendance" : "My monthly salary"}</h2>
       <div class="summary-tiles">
-        <div class="tile"><div class="num">${salary?.monthly_salary != null ? money(salary.monthly_salary) : "—"}</div><div class="lbl">Monthly salary</div></div>
-        <div class="tile"><div class="num">${balErr ? "—" : Number(balance).toFixed(1)}</div><div class="lbl">Paid leave balance (${monthLabel})</div></div>
+        ${salaryTileHtml}
+        ${balanceTileHtml}
+        ${effTileHtml}
       </div>
+      ${!effErr && eff.unmarked_days ? `<div class="hint-text">${eff.unmarked_days} day(s) not marked yet this month.</div>` : ""}
       ${balErr ? `<div class="error-text">${escapeHtml(balErr.message)}</div>` : ""}
     </div>
     <div class="card">
+      <div class="row" style="margin-bottom:10px;">
+        <div><label>Month</label>${monthSelectHtml("cal-month", month)}</div>
+        <div><label>Year</label><input type="number" id="cal-year" value="${year}" /></div>
+      </div>
       <div class="staff-row" style="border-bottom:none; padding-top:0;">
         <button class="btn btn-outline btn-small" id="prev-month">&larr; Prev</button>
         <h2 style="margin:0;">${monthLabel}</h2>
@@ -577,18 +708,24 @@ async function renderMyAttendanceTab(el) {
     </div>
   `;
 
-  $("#prev-month", el).onclick = () => {
-    let m = month - 1, y = year;
-    if (m < 1) { m = 12; y -= 1; }
+  if (onBack) $("#cal-back", el).onclick = onBack;
+
+  function goTo(y, m) {
     el.dataset.year = y; el.dataset.month = m;
-    renderMyAttendanceTab(el);
-  };
-  $("#next-month", el).onclick = () => {
-    let m = month + 1, y = year;
-    if (m > 12) { m = 1; y += 1; }
-    el.dataset.year = y; el.dataset.month = m;
-    renderMyAttendanceTab(el);
-  };
+    renderPersonalCalendar(el, { staffId, staffName, salaryAccess, onBack });
+  }
+  $("#prev-month", el).onclick = () => { let m = month - 1, y = year; if (m < 1) { m = 12; y -= 1; } goTo(y, m); };
+  $("#next-month", el).onclick = () => { let m = month + 1, y = year; if (m > 12) { m = 1; y += 1; } goTo(y, m); };
+  $("#cal-month", el).onchange = (e) => goTo(year, parseInt(e.target.value, 10));
+  $("#cal-year", el).onchange = (e) => goTo(parseInt(e.target.value, 10), month);
+}
+
+// ============================================================================
+// STAFF: My Attendance tab (calendar + balance + salary) -- thin wrapper
+// around the shared personal-calendar renderer.
+// ============================================================================
+function renderMyAttendanceTab(el) {
+  return renderPersonalCalendar(el, { staffId: profile.id, staffName: null, salaryAccess: "self", onBack: null });
 }
 
 function cssVarFromClass(cls) {
@@ -691,7 +828,7 @@ async function loadMyRequests() {
           const future = d.date > todayStr();
           const canAct = r.status === "approved" && d.day_status === "active" && future;
           return `
-            <div class="day-line" data-day-id="${d.id}" data-portion="${d.day_portion}">
+            <div class="day-line" data-day-id="${d.id}" data-portion="${d.day_portion}" data-date="${d.date}">
               <span>${fmtDateNice(d.date)}</span>
               <span style="display:flex; gap:6px; align-items:center;">
                 ${badge}
@@ -707,6 +844,8 @@ async function loadMyRequests() {
   $all(".act-cancel-day", container).forEach((btn) => {
     btn.onclick = async () => {
       const line = btn.closest(".day-line");
+      const ok = await confirmAction(`Cancel your approved leave for ${fmtDateNice(line.dataset.date)}?`);
+      if (!ok) return;
       const { error } = await sb.from("leave_request_days").update({ day_status: "cancelled" }).eq("id", line.dataset.dayId);
       if (error) { alert("Couldn't cancel: " + error.message); return; }
       await loadMyRequests();
@@ -715,6 +854,8 @@ async function loadMyRequests() {
   $all(".act-shorten-day", container).forEach((btn) => {
     btn.onclick = async () => {
       const line = btn.closest(".day-line");
+      const ok = await confirmAction(`Shorten your approved leave for ${fmtDateNice(line.dataset.date)} to a half-day?`);
+      if (!ok) return;
       const { error } = await sb.from("leave_request_days").update({ day_portion: "half" }).eq("id", line.dataset.dayId);
       if (error) { alert("Couldn't update: " + error.message); return; }
       await loadMyRequests();
@@ -730,12 +871,77 @@ async function loadMyRequests() {
 }
 
 // ============================================================================
-// OWNER: Approvals tab
+// OWNER: Approvals tab -- Notifications subtab + Approvals subtab
+// (pending + history, with the ability to alter already-approved leave)
 // ============================================================================
-async function renderApprovalsTab(el) {
-  el.innerHTML = `<div class="card"><h2>Pending leave requests</h2><div id="approvals-list">Loading…</div></div>`;
-  const container = $("#approvals-list");
+function renderApprovalsTab(el) {
+  const view = el.dataset.view || "notifications";
+  el.innerHTML = `
+    <div class="subtabs">
+      <button data-view="notifications" class="${view === "notifications" ? "active" : ""}">Notifications</button>
+      <button data-view="approvals" class="${view === "approvals" ? "active" : ""}">Approvals</button>
+    </div>
+    <div id="approvals-body"></div>
+  `;
+  $all(".subtabs button", el).forEach((btn) => {
+    btn.onclick = () => { el.dataset.view = btn.dataset.view; renderApprovalsTab(el); };
+  });
+  const body = $("#approvals-body", el);
+  if (view === "notifications") return renderNotificationsView(body);
+  return renderApprovalsView(body);
+}
 
+const NOTIFICATION_LABELS = {
+  leave_requested: "New leave request",
+  leave_altered: "Approved leave altered",
+  absent_no_notice: "Absent (no notice)",
+  half_day_no_notice: "Half-day (no notice)",
+  overtime_logged: "Overtime logged",
+  balance_adjusted: "Balance adjusted",
+};
+
+async function renderNotificationsView(el) {
+  el.innerHTML = `<div class="card"><h2>Notifications</h2><div id="notif-list">Loading…</div></div>`;
+  const container = $("#notif-list");
+
+  const { data, error } = await sb
+    .from("notifications")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(50);
+
+  if (error) { container.innerHTML = `<div class="error-text">${escapeHtml(error.message)}</div>`; return; }
+  if (!data || data.length === 0) { container.innerHTML = `<div class="hint-text">Nothing to show yet.</div>`; return; }
+
+  container.innerHTML = data.map((n) => `
+    <div class="day-line" data-id="${n.id}" style="${n.is_read ? "opacity:0.55;" : ""}">
+      <span>
+        <strong>${escapeHtml(NOTIFICATION_LABELS[n.type] || n.type)}</strong> — ${escapeHtml(n.message)}
+        <div class="hint-text">${new Date(n.created_at).toLocaleString()}</div>
+      </span>
+      ${!n.is_read ? `<button class="btn btn-outline btn-small act-mark-read">Mark read</button>` : ""}
+    </div>`).join("");
+
+  $all(".act-mark-read", container).forEach((btn) => {
+    btn.onclick = async () => {
+      const line = btn.closest(".day-line");
+      const { error: e2 } = await sb.from("notifications").update({ is_read: true }).eq("id", line.dataset.id);
+      if (e2) { alert("Couldn't update: " + e2.message); return; }
+      renderNotificationsView(el);
+    };
+  });
+}
+
+async function renderApprovalsView(el) {
+  el.innerHTML = `
+    <div class="card"><h2>Pending leave requests</h2><div id="approvals-list">Loading…</div></div>
+    <div class="card"><h2>Leave history</h2><div id="approvals-history">Loading…</div></div>
+  `;
+  await loadPendingApprovals($("#approvals-list", el), el);
+  await loadApprovalsHistory($("#approvals-history", el), el);
+}
+
+async function loadPendingApprovals(container, parentEl) {
   const { data, error } = await sb
     .from("leave_requests")
     .select("*, profiles!staff_id(full_name), leave_request_days(*)")
@@ -793,7 +999,7 @@ async function renderApprovalsTab(el) {
         status: "approved", reviewed_by: profile.id, reviewed_at: new Date().toISOString(),
       }).eq("id", reqId);
       if (error) { alert("Couldn't approve: " + error.message); return; }
-      renderApprovalsTab(el);
+      renderApprovalsView(parentEl);
     };
   });
   $all(".act-reject", container).forEach((btn) => {
@@ -802,7 +1008,70 @@ async function renderApprovalsTab(el) {
         status: "rejected", reviewed_by: profile.id, reviewed_at: new Date().toISOString(),
       }).eq("id", btn.dataset.id);
       if (error) { alert("Couldn't reject: " + error.message); return; }
-      renderApprovalsTab(el);
+      renderApprovalsView(parentEl);
+    };
+  });
+}
+
+async function loadApprovalsHistory(container, parentEl) {
+  const { data, error } = await sb
+    .from("leave_requests")
+    .select("*, profiles!staff_id(full_name), leave_request_days(*)")
+    .in("status", ["approved", "rejected"])
+    .order("created_at", { ascending: false })
+    .limit(30);
+
+  if (error) { container.innerHTML = `<div class="error-text">${escapeHtml(error.message)}</div>`; return; }
+  if (!data || data.length === 0) { container.innerHTML = `<div class="hint-text">No decided requests yet.</div>`; return; }
+
+  const statusCls = { approved: "badge-approved", rejected: "badge-rejected" };
+
+  container.innerHTML = data.map((r) => {
+    const days = (r.leave_request_days || []).sort((a, b) => a.date.localeCompare(b.date));
+    return `
+      <div class="request-item">
+        <div class="request-head">
+          <div><strong>${escapeHtml(r.profiles?.full_name || "Unknown")}</strong> —
+            ${fmtDateNice(r.from_date)}${r.to_date !== r.from_date ? " – " + fmtDateNice(r.to_date) : ""}</div>
+          <span class="badge ${statusCls[r.status]}">${r.status}</span>
+        </div>
+        <div class="hint-text">${escapeHtml(r.reason)}</div>
+        ${days.map((d) => {
+          const badge = d.day_status === "cancelled"
+            ? `<span class="badge badge-cancelled">Cancelled</span>`
+            : (() => { const b = leaveDayBadge(d.day_portion, d.type); return `<span class="badge ${b.cls}">${b.label}</span>`; })();
+          const canAct = r.status === "approved" && d.day_status === "active";
+          return `
+            <div class="day-line" data-day-id="${d.id}" data-date="${d.date}" data-portion="${d.day_portion}" data-staff-name="${escapeHtml(r.profiles?.full_name || "")}">
+              <span>${fmtDateNice(d.date)}</span>
+              <span style="display:flex; gap:6px; align-items:center;">
+                ${badge}
+                ${canAct ? `<button class="btn btn-outline btn-small act-owner-cancel-day">Cancel</button>` : ""}
+                ${canAct && d.day_portion === "full" ? `<button class="btn btn-outline btn-small act-owner-shorten-day">Shorten to half-day</button>` : ""}
+              </span>
+            </div>`;
+        }).join("")}
+      </div>`;
+  }).join("");
+
+  $all(".act-owner-cancel-day", container).forEach((btn) => {
+    btn.onclick = async () => {
+      const line = btn.closest(".day-line");
+      const ok = await confirmAction(`Cancel ${line.dataset.staffName}'s approved leave for ${fmtDateNice(line.dataset.date)}?`);
+      if (!ok) return;
+      const { error: e2 } = await sb.from("leave_request_days").update({ day_status: "cancelled" }).eq("id", line.dataset.dayId);
+      if (e2) { alert("Couldn't cancel: " + e2.message); return; }
+      renderApprovalsView(parentEl);
+    };
+  });
+  $all(".act-owner-shorten-day", container).forEach((btn) => {
+    btn.onclick = async () => {
+      const line = btn.closest(".day-line");
+      const ok = await confirmAction(`Shorten ${line.dataset.staffName}'s approved leave for ${fmtDateNice(line.dataset.date)} to a half-day?`);
+      if (!ok) return;
+      const { error: e2 } = await sb.from("leave_request_days").update({ day_portion: "half" }).eq("id", line.dataset.dayId);
+      if (e2) { alert("Couldn't update: " + e2.message); return; }
+      renderApprovalsView(parentEl);
     };
   });
 }
@@ -824,7 +1093,7 @@ async function renderStaffSalaryTab(el) {
   container.innerHTML = (data || []).map((s) => `
     <div class="staff-row">
       <div>
-        <div class="staff-name">${escapeHtml(s.full_name)} <span class="hint-text">(${escapeHtml(s.role || "")})</span></div>
+        <div class="staff-name" data-name="${escapeHtml(s.full_name)}">${escapeHtml(s.full_name)} <span class="hint-text">(${escapeHtml(s.role || "")})</span></div>
         <div class="staff-meta">${escapeHtml(s.employee_code || "")} ${s.department ? "· " + escapeHtml(s.department) : ""} ${s.is_active ? "" : "· inactive"}</div>
       </div>
       <div style="display:flex; gap:6px; align-items:center;">
@@ -837,9 +1106,13 @@ async function renderStaffSalaryTab(el) {
   $all(".act-save-salary", container).forEach((btn) => {
     btn.onclick = async () => {
       const staffId = btn.dataset.staff;
+      const row = btn.closest(".staff-row");
+      const staffName = $(".staff-name", row).dataset.name;
       const input = $(`.salary-input[data-staff="${staffId}"]`, container);
       const val = parseFloat(input.value);
       if (isNaN(val)) { alert("Enter a salary amount first."); return; }
+      const ok = await confirmAction(`Set ${staffName}'s monthly salary to ${money(val)}?`);
+      if (!ok) return;
       const { error } = await sb.from("staff_salary").upsert(
         { staff_id: staffId, monthly_salary: val, updated_by: profile.id },
         { onConflict: "staff_id" }
@@ -849,6 +1122,65 @@ async function renderStaffSalaryTab(el) {
       setTimeout(() => { btn.textContent = "Save"; }, 1200);
     };
   });
+}
+
+// ============================================================================
+// OWNER: Payroll tab
+// ============================================================================
+async function renderPayrollTab(el) {
+  const now = new Date();
+  let year = parseInt(el.dataset.year || now.getFullYear(), 10);
+  let month = parseInt(el.dataset.month || now.getMonth() + 1, 10);
+  el.dataset.year = year; el.dataset.month = month;
+
+  el.innerHTML = `
+    <div class="card">
+      <h2>Payroll</h2>
+      <div class="row">
+        <div><label>Month</label>${monthSelectHtml("pr-month", month)}</div>
+        <div><label>Year</label><input type="number" id="pr-year" value="${year}" /></div>
+      </div>
+      <div id="pr-table" style="overflow-x:auto; margin-top:14px;">Loading…</div>
+    </div>
+  `;
+  $("#pr-month", el).onchange = (e) => { el.dataset.month = e.target.value; renderPayrollTab(el); };
+  $("#pr-year", el).onchange = (e) => { el.dataset.year = e.target.value; renderPayrollTab(el); };
+
+  const tableEl = $("#pr-table", el);
+  const { data: staffList, error: staffErr } = await sb
+    .from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).order("full_name");
+  if (staffErr) { tableEl.innerHTML = `<div class="error-text">${escapeHtml(staffErr.message)}</div>`; return; }
+  if (!staffList || staffList.length === 0) { tableEl.innerHTML = `<div class="hint-text">No active staff yet.</div>`; return; }
+
+  const rows = await Promise.all(staffList.map(async (s) => {
+    const [{ data: eff }, { data: bal }, { data: sal }] = await Promise.all([
+      sb.rpc("effective_working_days", { p_staff_id: s.id, p_year: year, p_month: month }),
+      sb.rpc("staff_paid_leave_balance", { p_staff_id: s.id, p_year: year, p_month: month }),
+      sb.rpc("calculate_salary", { p_staff_id: s.id, p_year: year, p_month: month }),
+    ]);
+    const e = (eff && eff[0]) || {};
+    return { name: s.full_name, effective: e.effective_days, unmarked: e.unmarked_days, balance: bal, salary: sal };
+  }));
+
+  tableEl.innerHTML = `<table style="border-collapse:collapse; width:100%; font-size:13px;">
+    <thead><tr>
+      <th style="text-align:left; padding:6px;">Staff</th>
+      <th style="padding:6px;">Effective days</th>
+      <th style="padding:6px;">Unmarked</th>
+      <th style="padding:6px;">Paid leave balance</th>
+      <th style="padding:6px;">Calculated salary</th>
+    </tr></thead>
+    <tbody>
+      ${rows.map((r) => `
+        <tr style="border-top:1px solid var(--border);">
+          <td style="padding:6px;">${escapeHtml(r.name)}</td>
+          <td style="padding:6px; text-align:center;">${r.effective != null ? Number(r.effective).toFixed(2) : "—"}</td>
+          <td style="padding:6px; text-align:center;">${r.unmarked ?? "—"}</td>
+          <td style="padding:6px; text-align:center;">${r.balance != null ? Number(r.balance).toFixed(2) : "—"}</td>
+          <td style="padding:6px; text-align:right;">${r.salary != null ? money(r.salary) : "—"}</td>
+        </tr>`).join("")}
+    </tbody>
+  </table>`;
 }
 
 // ============================================================================
