@@ -157,15 +157,25 @@ function monthSelectHtml(id, selectedMonth) {
 // Boot / auth
 // ----------------------------------------------------------------------------
 async function boot() {
+  // Registered before the initial getSession() so a password-recovery link
+  // (the browser landing here with #type=recovery in the URL) is caught
+  // even if Supabase fires the event before the rest of boot() resolves.
+  sb.auth.onAuthStateChange((event) => {
+    if (event === "SIGNED_OUT") renderLogin();
+    if (event === "PASSWORD_RECOVERY") renderSetNewPassword();
+  });
+
+  if (window.location.hash.includes("type=recovery")) {
+    renderSetNewPassword();
+    return;
+  }
+
   const { data: { session } } = await sb.auth.getSession();
   if (session) {
     await loadProfileAndRender();
   } else {
     renderLogin();
   }
-  sb.auth.onAuthStateChange((event) => {
-    if (event === "SIGNED_OUT") renderLogin();
-  });
 }
 
 function renderLogin() {
@@ -183,6 +193,7 @@ function renderLogin() {
           <button class="btn btn-primary" style="width:100%; margin-top:16px;" type="submit">Sign in</button>
         </form>
         <div class="error-text" id="login-error" style="display:none"></div>
+        <a href="#" id="forgot-link" class="forgot-link">Forgot password?</a>
       </div>
     </div>`;
 
@@ -202,6 +213,86 @@ function renderLogin() {
       $("#login-error").textContent = error.message;
       return;
     }
+    await loadProfileAndRender();
+  });
+
+  $("#forgot-link").addEventListener("click", async (e) => {
+    e.preventDefault();
+    await handleForgotPassword();
+  });
+}
+
+// Sends a password-reset email. Uses whatever URL the app is currently
+// running at as the return address, so it works the same on any hosting
+// (GitHub Pages, a custom domain, etc.) without needing to hardcode one --
+// as long as that URL is also listed under Authentication > URL
+// Configuration > Redirect URLs in the Supabase dashboard.
+async function handleForgotPassword() {
+  const data = await openModal(
+    "Reset your password",
+    `<label>Email</label>
+     <input type="email" name="email" required autocomplete="username" />
+     <p class="hint-text" style="margin-top:8px;">We'll email a link to set a new password. This only works if your account was set up with an email address.</p>`,
+    "Send reset link"
+  );
+  if (!data) return;
+  const email = (data.email || "").trim();
+  if (!email) return;
+  const { error } = await sb.auth.resetPasswordForEmail(email, {
+    redirectTo: window.location.origin + window.location.pathname,
+  });
+  if (error) {
+    alert("Couldn't send reset link: " + error.message);
+    return;
+  }
+  alert("If that email has an account, a reset link has been sent. Check the inbox (and spam folder).");
+}
+
+// Shown when the page is opened from a password-reset email link. The
+// Supabase client has already turned that link's token into a temporary
+// "recovery" session behind the scenes -- this screen just collects the
+// new password and applies it to that session.
+function renderSetNewPassword() {
+  app.innerHTML = `
+    <div class="login-wrap">
+      <div class="login-box">
+        <h1>Set a new password</h1>
+        <p class="sub">Choose a new password for your account.</p>
+        <form id="reset-form">
+          <label>New password</label>
+          <input type="password" name="password" required minlength="6" autocomplete="new-password" />
+          <label>Confirm new password</label>
+          <input type="password" name="confirm" required minlength="6" autocomplete="new-password" />
+          <button class="btn btn-primary" style="width:100%; margin-top:16px;" type="submit">Set password</button>
+        </form>
+        <div class="error-text" id="reset-error" style="display:none"></div>
+      </div>
+    </div>`;
+
+  $("#reset-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const password = fd.get("password");
+    const confirm = fd.get("confirm");
+    const errEl = $("#reset-error");
+    if (password !== confirm) {
+      errEl.style.display = "block";
+      errEl.textContent = "Passwords don't match.";
+      return;
+    }
+    const btn = $("#reset-form button[type=submit]");
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+    const { error } = await sb.auth.updateUser({ password });
+    btn.disabled = false;
+    btn.textContent = "Set password";
+    if (error) {
+      errEl.style.display = "block";
+      errEl.textContent = error.message;
+      return;
+    }
+    // Drop the recovery token from the URL so a reload doesn't re-trigger this screen.
+    history.replaceState(null, "", window.location.pathname);
     await loadProfileAndRender();
   });
 }
@@ -234,6 +325,52 @@ async function logout() {
   await sb.auth.signOut();
 }
 
+// Account settings, reachable by any role from the topbar. Currently just
+// a change-password form; re-verifies the current password first so an
+// unattended, already-signed-in session can't be hijacked into a takeover.
+async function openAccountModal() {
+  const data = await openModal(
+    "Account settings",
+    `
+    <p class="hint-text" style="margin:0 0 10px;">Signed in as ${escapeHtml(profile.full_name)} (${escapeHtml(roleLabel(profile.role))})</p>
+    <h3 style="margin-top:0;">Change password</h3>
+    <label>Current password</label>
+    <input type="password" name="current" required autocomplete="current-password" />
+    <label>New password</label>
+    <input type="password" name="new_password" required minlength="6" autocomplete="new-password" />
+    <label>Confirm new password</label>
+    <input type="password" name="confirm" required minlength="6" autocomplete="new-password" />
+    `,
+    "Change password"
+  );
+  if (!data) return;
+
+  if (data.new_password !== data.confirm) {
+    alert("New passwords don't match.");
+    return;
+  }
+  if (data.new_password.length < 6) {
+    alert("New password must be at least 6 characters.");
+    return;
+  }
+
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user?.email) {
+    alert("This account has no email on file, so password changes aren't available here yet. Ask the owner to update it.");
+    return;
+  }
+
+  const { error: verifyError } = await sb.auth.signInWithPassword({ email: user.email, password: data.current });
+  if (verifyError) {
+    alert("Current password is incorrect.");
+    return;
+  }
+
+  const { error } = await sb.auth.updateUser({ password: data.new_password });
+  if (error) { alert("Couldn't change password: " + error.message); return; }
+  alert("Password changed.");
+}
+
 // ----------------------------------------------------------------------------
 // Shell: topbar + tabs + tab content
 // ----------------------------------------------------------------------------
@@ -257,7 +394,10 @@ function renderShell() {
         <h1>Hospital Staff Manager</h1>
         <div class="who">${escapeHtml(profile.full_name)} · ${escapeHtml(roleLabel(profile.role))}</div>
       </div>
-      <button id="logout-btn">Sign out</button>
+      <div class="topbar-actions">
+        <button id="account-btn">Account</button>
+        <button id="logout-btn">Sign out</button>
+      </div>
     </div>
     <div class="tabs">
       ${tabs.map(([key, label]) =>
@@ -267,6 +407,7 @@ function renderShell() {
     <main id="tab-content"></main>
   `;
   $("#logout-btn").onclick = logout;
+  $("#account-btn").onclick = openAccountModal;
   $all(".tabs button").forEach((btn) => {
     btn.onclick = () => { activeTab = btn.dataset.tab; renderShell(); };
   });

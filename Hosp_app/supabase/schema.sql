@@ -562,9 +562,13 @@ end;
 $$ language plpgsql stable security definer;
 
 -- Calculated salary for one month: monthly salary / actual days in that
--- month * effective working days. Owner can compute for anyone; a staff
--- member only for themself (the app only surfaces this once the viewed
--- month has fully ended -- enforced client-side, not here, since a staff
+-- month * (effective working days + current paid-leave balance). The
+-- unused paid-leave balance is added on top of effective days -- an
+-- employee who worked every day AND still has paid leave left over is
+-- paid for (effective_days + balance) days out of the month, not just
+-- effective_days alone. Owner can compute for anyone; a staff member
+-- only for themself (the app only surfaces this once the viewed month
+-- has fully ended -- enforced client-side, not here, since a staff
 -- member checking their own in-progress-month number isn't a security
 -- issue, just not a meaningful one yet). Marker never gets access.
 create or replace function calculate_salary(p_staff_id uuid, p_year int, p_month int) returns numeric as $$
@@ -572,6 +576,7 @@ declare
   v_salary  numeric;
   v_days    int;
   v_eff     numeric;
+  v_bal     numeric;
 begin
   if not (app_role() = 'owner' or p_staff_id = auth.uid()) then
     raise exception 'Not permitted.';
@@ -585,8 +590,9 @@ begin
 
   v_days := extract(day from (date_trunc('month', make_date(p_year, p_month, 1)) + interval '1 month - 1 day'))::int;
   select effective_days into v_eff from effective_working_days(p_staff_id, p_year, p_month);
+  v_bal := paid_leave_balance(p_staff_id, p_year, p_month);
 
-  return round(v_salary / v_days * v_eff, 2);
+  return round(v_salary / v_days * (v_eff + v_bal), 2);
 end;
 $$ language plpgsql stable security definer;
 

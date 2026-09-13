@@ -54,6 +54,8 @@ body {
   color: #e6efea;
 }
 
+.topbar-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
 .topbar button {
   background: rgba(255,255,255,0.14);
   border: 1px solid rgba(255,255,255,0.3);
@@ -277,6 +279,16 @@ textarea { min-height: 60px; resize: vertical; }
   color: var(--green-dark);
 }
 .login-box p.sub { color: var(--text-dim); font-size: 13px; margin: 0 0 18px; }
+
+.forgot-link {
+  display: block;
+  text-align: center;
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--green-dark);
+  text-decoration: none;
+}
+.forgot-link:hover { text-decoration: underline; }
 
 .subtabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
 .subtabs button {
