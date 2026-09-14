@@ -518,7 +518,7 @@ async function renderDailyAttendance(el, { isOwner }) {
   });
 
   const [{ data: staffList, error: staffErr }, { data: attendance }, { data: leaveDays }, { data: overtimeRows }] = await Promise.all([
-    sb.from("profiles").select("id, full_name, employee_code").eq("role", "staff").eq("is_active", true).order("full_name"),
+    sb.from("profiles").select("id, full_name, employee_code").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
     sb.from("attendance").select("staff_id, status").eq("date", dateStr),
     sb.from("leave_request_days").select("staff_id, day_portion, type").eq("date", dateStr).eq("day_status", "active"),
     sb.from("overtime_credits").select("staff_id, day_portion").eq("date", dateStr),
@@ -771,7 +771,7 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
   $("#mo-month", body).addEventListener("change", rerender);
 
   const [{ data: staffList, error: staffErr }, { data: att }, { data: otRows }] = await Promise.all([
-    sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).order("full_name"),
+    sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
     sb.from("attendance").select("staff_id, date, status").gte("date", start).lte("date", end),
     sb.from("overtime_credits").select("staff_id, date").gte("date", start).lte("date", end),
   ]);
@@ -1376,6 +1376,7 @@ async function renderStaffSalaryTab(el) {
     .from("profiles")
     .select("id, full_name, employee_code, role, department, designation, is_active, staff_salary!staff_id(monthly_salary)")
     .not("role", "is", null)
+    .eq("is_test", false)
     .order("full_name");
 
   if (error) { container.innerHTML = `<div class="error-text">${escapeHtml(error.message)}</div>`; return; }
@@ -1438,7 +1439,7 @@ async function renderPayrollTab(el) {
 
   const tableEl = $("#pr-table", el);
   const { data: staffList, error: staffErr } = await sb
-    .from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).order("full_name");
+    .from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name");
   if (staffErr) { tableEl.innerHTML = `<div class="error-text">${escapeHtml(staffErr.message)}</div>`; return; }
   if (!staffList || staffList.length === 0) { tableEl.innerHTML = `<div class="hint-text">No active staff yet.</div>`; return; }
 
@@ -1477,7 +1478,7 @@ async function renderPayrollTab(el) {
 // OWNER: Balance Adjustments tab
 // ============================================================================
 async function renderAdjustmentsTab(el) {
-  const { data: staffList } = await sb.from("profiles").select("id, full_name").eq("role", "staff").order("full_name");
+  const { data: staffList } = await sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_test", false).order("full_name");
 
   el.innerHTML = `
     <div class="card">

@@ -45,6 +45,7 @@ create table profiles (
   designation   text,
   join_date     date,
   is_active     boolean not null default true,
+  is_test       boolean not null default false,  -- excluded from every staff-listing view (Staff Directory, Attendance, Payroll, ...) but otherwise fully functional -- for the developer's own ongoing testing, invisible to real users
   created_at    timestamptz not null default now()
 );
 
@@ -896,3 +897,46 @@ create policy "staff_update_own_leave_days" on leave_request_days for update
 -- notifications -- owner-only, front to back ---------------------------------
 create policy "owner_all_notifications" on notifications for all
   using (app_role() = 'owner');
+
+-- ============================================================================
+-- Notifications housekeeping: auto-delete old notifications so the
+-- Notifications view doesn't accumulate forever, WITHOUT deleting one that
+-- is still about a future-dated event. Each notification's "relevant date"
+-- is the date it's actually about (a leave request's to_date, an
+-- attendance/overtime date, an adjustment's month) rather than just when it
+-- was created -- a leave request submitted in September for early-October
+-- dates stays until early October has itself passed, not just September.
+-- ============================================================================
+create or replace function notification_relevant_date(p_type notification_type, p_related_id uuid) returns date as $$
+declare
+  v_date date;
+begin
+  if p_type in ('leave_requested', 'leave_altered') then
+    select to_date into v_date from leave_requests where id = p_related_id;
+  elsif p_type in ('absent_no_notice', 'half_day_no_notice') then
+    select date into v_date from attendance where id = p_related_id;
+  elsif p_type = 'overtime_logged' then
+    select date into v_date from overtime_credits where id = p_related_id;
+  elsif p_type = 'balance_adjusted' then
+    select (make_date(year, month, 1) + interval '1 month - 1 day')::date into v_date
+    from leave_balance_adjustments where id = p_related_id;
+  end if;
+  return v_date;
+end;
+$$ language plpgsql stable security definer;
+
+-- A notification is eligible once its relevant date's month has fully
+-- ended AND a grace period has passed on top of that (so "Sept 30" clears
+-- on/after Oct 5 -- a few days into the next month, not the instant it
+-- turns October). Falls back to created_at if the source row is gone.
+create or replace function cleanup_old_notifications() returns void as $$
+declare
+  grace_days constant int := 4;
+begin
+  delete from notifications n
+  where (
+    date_trunc('month', coalesce(notification_relevant_date(n.type, n.related_id), n.created_at::date))
+    + interval '1 month - 1 day'
+  )::date + grace_days < current_date;
+end;
+$$ language plpgsql security definer;
