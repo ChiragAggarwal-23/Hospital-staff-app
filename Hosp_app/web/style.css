@@ -138,6 +138,16 @@ input, select, textarea {
   background: #fff;
 }
 
+/* iOS Safari centers the displayed value inside type="date" inputs by
+   default, which reads as misaligned next to every other left-aligned
+   field in the app -- force it consistently left on every platform. */
+input[type="date"] {
+  text-align: left;
+}
+input[type="date"]::-webkit-date-and-time-value {
+  text-align: left;
+}
+
 textarea { min-height: 60px; resize: vertical; }
 
 .row { display: flex; gap: 10px; flex-wrap: wrap; }

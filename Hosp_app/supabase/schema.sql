@@ -28,18 +28,41 @@ create type attendance_status as enum (
 -- ----------------------------------------------------------------------------
 -- profiles: one row per login. No salary here on purpose (marker can read
 -- this table, so nothing sensitive belongs in it).
+--
+-- employee_code and role are both nullable: a self-signed-up account lands
+-- here with both null ("pending" -- see handle_new_user() below) and gets
+-- neither until the owner approves it and fills them in. A null role means
+-- app_role() returns null, which every RLS policy below treats as "no
+-- access" -- so a pending account can read nothing but its own row until
+-- the owner assigns it a real role.
 -- ----------------------------------------------------------------------------
 create table profiles (
   id            uuid primary key references auth.users(id) on delete cascade,
-  employee_code text unique not null,
+  employee_code text unique,
   full_name     text not null,
-  role          user_role not null default 'staff',
+  role          user_role,
   department    text,
   designation   text,
   join_date     date,
   is_active     boolean not null default true,
   created_at    timestamptz not null default now()
 );
+
+-- Auto-creates the matching profiles row the moment someone signs themself
+-- up (sb.auth.signUp()). full_name comes from the signup form via
+-- supabase's user metadata; everything else is left null/pending until the
+-- owner approves the account in the app's Staff Directory tab.
+create or replace function handle_new_user() returns trigger as $$
+begin
+  insert into public.profiles (id, full_name, is_active)
+  values (new.id, coalesce(new.raw_user_meta_data->>'full_name', 'New sign-up'), false);
+  return new;
+end;
+$$ language plpgsql security definer set search_path = public;
+
+create trigger on_auth_user_created
+after insert on auth.users
+for each row execute function handle_new_user();
 
 -- ----------------------------------------------------------------------------
 -- staff_salary: separate table so the marker's access can exclude it
@@ -702,7 +725,7 @@ begin
 
   insert into notifications (type, staff_id, message, related_id)
   values (
-    case when NEW.status = 'absent_no_notice' then 'absent_no_notice' else 'half_day_no_notice' end,
+    (case when NEW.status = 'absent_no_notice' then 'absent_no_notice' else 'half_day_no_notice' end)::notification_type,
     NEW.staff_id,
     coalesce(staff_name, 'A staff member') || ' marked ' ||
     (case when NEW.status = 'absent_no_notice' then 'Absent (no notice)' else 'Half-day (no notice)' end) ||

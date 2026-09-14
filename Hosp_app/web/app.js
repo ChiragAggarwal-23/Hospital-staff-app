@@ -1,5 +1,5 @@
 // ============================================================================
-// Hospital Staff Manager — app.js
+// Ananda Asian Staff Manager — app.js
 // Plain JavaScript, no build step. Talks directly to Supabase (Postgres +
 // Auth + Row Level Security) using the client library loaded via CDN in
 // index.html. All the real business rules (who can do what, the leave
@@ -183,7 +183,7 @@ function renderLogin() {
   app.innerHTML = `
     <div class="login-wrap">
       <div class="login-box">
-        <h1>Hospital Staff Manager</h1>
+        <h1>Ananda Asian Staff Manager</h1>
         <p class="sub">Sign in with the login you were given.</p>
         <form id="login-form">
           <label>Email or login ID</label>
@@ -193,6 +193,7 @@ function renderLogin() {
           <button class="btn btn-primary" style="width:100%; margin-top:16px;" type="submit">Sign in</button>
         </form>
         <div class="error-text" id="login-error" style="display:none"></div>
+        <a href="#" id="signup-link" class="forgot-link">New here? Create an account</a>
         <a href="#" id="forgot-link" class="forgot-link">Forgot password?</a>
       </div>
     </div>`;
@@ -220,6 +221,54 @@ function renderLogin() {
     e.preventDefault();
     await handleForgotPassword();
   });
+
+  $("#signup-link").addEventListener("click", async (e) => {
+    e.preventDefault();
+    await handleSignUp();
+  });
+}
+
+// Self-signup. Collects only what the person themself should be trusted to
+// provide -- name, email, password. Nothing role/access-related is asked
+// here; the account lands as "pending" (see handle_new_user() in the
+// database) until the owner reviews it and fills in the rest from the
+// Staff Directory tab.
+async function handleSignUp() {
+  const data = await openModal(
+    "Create an account",
+    `
+    <label>Full name</label>
+    <input type="text" name="full_name" required autocomplete="name" />
+    <label>Email</label>
+    <input type="email" name="email" required autocomplete="username" />
+    <label>Password</label>
+    <input type="password" name="password" required minlength="6" autocomplete="new-password" />
+    <label>Confirm password</label>
+    <input type="password" name="confirm" required minlength="6" autocomplete="new-password" />
+    <p class="hint-text" style="margin-top:8px;">After you sign up, the owner will need to approve your account before you can sign in.</p>
+    `,
+    "Sign up"
+  );
+  if (!data) return;
+
+  const full_name = (data.full_name || "").trim();
+  const email = (data.email || "").trim();
+  if (!full_name || !email) { alert("Fill in your name and email."); return; }
+  if (data.password !== data.confirm) { alert("Passwords don't match."); return; }
+  if (data.password.length < 6) { alert("Password must be at least 6 characters."); return; }
+
+  const { data: signUpData, error } = await sb.auth.signUp({
+    email,
+    password: data.password,
+    options: { data: { full_name } },
+  });
+  if (error) { alert("Couldn't sign up: " + error.message); return; }
+
+  if (signUpData.session) {
+    await loadProfileAndRender();
+  } else {
+    alert("Account created! Check your email to confirm it, then sign in. After confirming, the owner still needs to approve your account before you can use the app.");
+  }
 }
 
 // Sends a password-reset email. Uses whatever URL the app is currently
@@ -311,8 +360,24 @@ async function loadProfileAndRender() {
     return;
   }
   profile = data;
+  if (!profile.role) { renderPendingScreen(); return; }
   activeTab = defaultTabForRole(profile.role);
   renderShell();
+}
+
+// Shown for a self-signed-up account the owner hasn't approved yet (no
+// role assigned). No tabs, nothing to do here but wait or sign out.
+function renderPendingScreen() {
+  app.innerHTML = `
+    <div class="login-wrap">
+      <div class="login-box">
+        <h1>Account pending approval</h1>
+        <p class="sub">Hi ${escapeHtml(profile.full_name)} — your account has been created but isn't active yet.
+        The owner needs to review it and assign your role before you can sign in. Check back later, or reach out to the owner directly.</p>
+        <button class="btn btn-outline" id="pending-signout-btn" style="width:100%;">Sign out</button>
+      </div>
+    </div>`;
+  $("#pending-signout-btn").onclick = logout;
 }
 
 function defaultTabForRole(role) {
@@ -391,7 +456,7 @@ function renderShell() {
   app.innerHTML = `
     <div class="topbar">
       <div>
-        <h1>Hospital Staff Manager</h1>
+        <h1>Ananda Asian Staff Manager</h1>
         <div class="who">${escapeHtml(profile.full_name)} · ${escapeHtml(roleLabel(profile.role))}</div>
       </div>
       <div class="topbar-actions">
@@ -1220,13 +1285,97 @@ async function loadApprovalsHistory(container, parentEl) {
 // ============================================================================
 // OWNER: Staff & Salary tab
 // ============================================================================
+// Self-signed-up accounts (role is still null) waiting on the owner to
+// review them. Approving fills in exactly the fields the account needs to
+// start using the app; salary (for staff) is set afterward from the
+// regular Staff Directory list below, same as any other staff member.
+async function renderPendingSignups(cardEl, listEl, parentEl) {
+  const { data, error } = await sb
+    .from("profiles")
+    .select("id, full_name, created_at")
+    .is("role", null)
+    .order("created_at");
+
+  if (error || !data || data.length === 0) { cardEl.style.display = "none"; return; }
+  cardEl.style.display = "block";
+
+  listEl.innerHTML = data.map((p) => `
+    <div class="request-item" data-pending="${p.id}">
+      <strong>${escapeHtml(p.full_name)}</strong>
+      <div class="hint-text">Signed up ${fmtDateNice((p.created_at || "").slice(0, 10))}</div>
+      <div class="row" style="margin-top:8px;">
+        <div><label>Employee code</label><input type="text" class="pend-code" placeholder="e.g. E010" /></div>
+        <div><label>Role</label>
+          <select class="pend-role">
+            <option value="staff">Staff</option>
+            <option value="marker">Attendance Marker</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div><label>Department</label><input type="text" class="pend-dept" /></div>
+        <div><label>Designation</label><input type="text" class="pend-desig" /></div>
+      </div>
+      <label>Join date</label>
+      <input type="date" class="pend-join" value="${todayStr()}" />
+      <div class="action-group" style="margin-top:10px;">
+        <button class="btn btn-primary btn-small act-approve">Approve</button>
+        <button class="btn btn-danger btn-small act-dismiss">Dismiss</button>
+      </div>
+    </div>`).join("");
+
+  $all(".act-approve", listEl).forEach((btn) => {
+    btn.onclick = async () => {
+      const row = btn.closest("[data-pending]");
+      const id = row.dataset.pending;
+      const name = $("strong", row).textContent;
+      const code = $(".pend-code", row).value.trim();
+      const role = $(".pend-role", row).value;
+      const department = $(".pend-dept", row).value.trim();
+      const designation = $(".pend-desig", row).value.trim();
+      const join_date = $(".pend-join", row).value;
+      if (!code) { alert("Enter an employee code first."); return; }
+      const ok = await confirmAction(`Approve ${name} as ${role === "marker" ? "Attendance Marker" : "Staff"} with employee code "${code}"?`);
+      if (!ok) return;
+      const { error: updErr } = await sb.from("profiles").update({
+        employee_code: code, role, department: department || null, designation: designation || null,
+        join_date: join_date || null, is_active: true,
+      }).eq("id", id);
+      if (updErr) { alert("Couldn't approve: " + updErr.message); return; }
+      renderStaffSalaryTab(parentEl);
+    };
+  });
+
+  $all(".act-dismiss", listEl).forEach((btn) => {
+    btn.onclick = async () => {
+      const row = btn.closest("[data-pending]");
+      const id = row.dataset.pending;
+      const name = $("strong", row).textContent;
+      const ok = await confirmAction(`Dismiss ${name}'s sign-up request? They'd need to sign up again if this was a mistake.`);
+      if (!ok) return;
+      const { error: delErr } = await sb.from("profiles").delete().eq("id", id);
+      if (delErr) { alert("Couldn't dismiss: " + delErr.message); return; }
+      renderStaffSalaryTab(parentEl);
+    };
+  });
+}
+
 async function renderStaffSalaryTab(el) {
-  el.innerHTML = `<div class="card"><h2>Staff Directory</h2><div id="staff-salary-list">Loading…</div></div>`;
-  const container = $("#staff-salary-list");
+  el.innerHTML = `
+    <div class="card" id="pending-signups-card" style="display:none;">
+      <h2>Pending sign-ups</h2>
+      <div id="pending-signups-list"></div>
+    </div>
+    <div class="card"><h2>Staff Directory</h2><div id="staff-salary-list">Loading…</div></div>`;
+
+  await renderPendingSignups($("#pending-signups-card", el), $("#pending-signups-list", el), el);
+
+  const container = $("#staff-salary-list", el);
 
   const { data, error } = await sb
     .from("profiles")
-    .select("id, full_name, employee_code, department, designation, is_active, staff_salary!staff_id(monthly_salary)")
+    .select("id, full_name, employee_code, role, department, designation, is_active, staff_salary!staff_id(monthly_salary)")
+    .not("role", "is", null)
     .order("full_name");
 
   if (error) { container.innerHTML = `<div class="error-text">${escapeHtml(error.message)}</div>`; return; }
