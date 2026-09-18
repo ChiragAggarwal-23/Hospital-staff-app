@@ -82,39 +82,32 @@ create table staff_salary (
 -- approved leave day, and can't be hand-edited by the marker.
 -- ----------------------------------------------------------------------------
 create table attendance (
-  id              uuid primary key default uuid_generate_v4(),
-  staff_id        uuid not null references profiles(id) on delete cascade,
-  date            date not null,
-  status          attendance_status not null,
-  time_in         time,
-  time_out        time,
-  locked_by_leave boolean not null default false,
-  marked_by       uuid references profiles(id),
-  notes           text,
-  created_at      timestamptz not null default now(),
-  updated_at      timestamptz not null default now(),
+  id               uuid primary key default uuid_generate_v4(),
+  staff_id         uuid not null references profiles(id) on delete cascade,
+  date             date not null,
+  status           attendance_status not null,
+  time_in          time,
+  time_out         time,
+  -- Populated by compute_attendance_hours() below whenever status = 'present'.
+  -- worked_minutes is null until both time_in and time_out are set; a
+  -- clock-in with no clock-out yet is treated as a full day for payroll
+  -- purposes (day_fraction = 1.0) until/unless a clock-out is logged.
+  worked_minutes    int,
+  day_fraction      numeric(4,2),        -- this date's contribution to effective working days, capped at 1.00
+  overtime_fraction numeric(4,2) not null default 0,  -- anything worked beyond 8h, credited to that month's paid-leave balance
+  locked_by_leave  boolean not null default false,
+  marked_by        uuid references profiles(id),
+  notes            text,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
   unique (staff_id, date)
 );
 
 create index idx_attendance_staff_date on attendance (staff_id, date);
 
--- ----------------------------------------------------------------------------
--- overtime_credits: one half-day credit per staff member per date logged.
--- Feeds directly into that month's paid-leave balance (see the balance
--- function below) -- doesn't touch attendance or leave_requests at all.
--- ----------------------------------------------------------------------------
-create table overtime_credits (
-  id           uuid primary key default uuid_generate_v4(),
-  staff_id     uuid not null references profiles(id) on delete cascade,
-  date         date not null,
-  day_portion  day_portion not null default 'half',  -- 'half' today; 'full' reserved for when full-day overtime is confirmed
-  reason       text,
-  recorded_by  uuid references profiles(id),
-  created_at   timestamptz not null default now(),
-  unique (staff_id, date)
-);
-
-create index idx_overtime_staff_date on overtime_credits (staff_id, date);
+-- Overtime no longer has its own table: it's derived automatically from
+-- attendance.overtime_fraction (see compute_attendance_hours() and
+-- paid_leave_balance() below), based on actual clock-in/clock-out times.
 
 -- ----------------------------------------------------------------------------
 -- leave_balance_adjustments: owner-only manual correction to a staff
@@ -207,7 +200,8 @@ $$ language sql stable security definer;
 -- The core payroll number: how many paid-leave days does this staff member
 -- have left for this specific month.
 --   = base 2/month
---   + 0.5 for every overtime day logged this month
+--   + every fraction of a day worked beyond 8h this month (auto-detected
+--     from clock-in/clock-out times -- see compute_attendance_hours())
 --   + any manual owner adjustment for this month
 --   - every currently-active date this month tagged 'paid', across every
 --     pending or approved request (pending counts too, so two requests
@@ -219,9 +213,10 @@ declare
   adjustments    numeric;
   consumed       numeric;
 begin
-  select coalesce(sum(case when day_portion = 'half' then 0.5 else 1.0 end), 0) into overtime_bonus
-  from overtime_credits
+  select coalesce(sum(overtime_fraction), 0) into overtime_bonus
+  from attendance
   where staff_id = p_staff_id
+    and status = 'present'
     and extract(year from date) = p_year
     and extract(month from date) = p_month;
 
@@ -520,36 +515,64 @@ before insert or update on attendance
 for each row execute function guard_attendance_write();
 
 -- ============================================================================
--- Trigger: overtime_credits -- overtime presumes a full day was already
--- worked, so it can only be logged for a date already marked 'present'.
+-- Trigger: compute_attendance_hours -- the actual clock-in/clock-out ->
+-- salary-fraction math, for any attendance row marked 'present'.
+--   - No time_in at all (shouldn't normally happen for 'present', but
+--     guarded anyway) or a clock-in with no clock-out yet: treated as a
+--     full day (day_fraction = 1.00) until a clock-out narrows it down --
+--     per the agreed rule, an unresolved clock-out never costs the staff
+--     member money, it just means the day isn't final yet.
+--   - Both times present: worked_minutes = time_out - time_in (must be
+--     positive -- a clock-out before clock-in is rejected outright).
+--     day_fraction = least(worked_minutes / 480, 1.00), rounded to 2dp.
+--     overtime_fraction = the leftover beyond 1.00 (also rounded to 2dp),
+--     which paid_leave_balance() below adds straight into that month's
+--     paid-leave balance -- exactly like the old manual overtime button
+--     did, just computed instead of separately logged.
+--   - Any other status (leave-synced, no-notice absent/half-day): these
+--     don't use clock times at all, so both fields are cleared/zeroed --
+--     effective_working_days() below uses its own fixed value for them.
 -- ============================================================================
-create or replace function guard_overtime_write() returns trigger as $$
-declare
-  att_status attendance_status;
+create or replace function compute_attendance_hours() returns trigger as $$
 begin
-  select status into att_status from attendance where staff_id = NEW.staff_id and date = NEW.date;
-  if att_status is distinct from 'present' then
-    raise exception 'Overtime can only be logged for a date already marked Present.';
+  if NEW.status = 'present' then
+    if NEW.time_in is null or NEW.time_out is null then
+      NEW.worked_minutes    := null;
+      NEW.day_fraction      := 1.00;
+      NEW.overtime_fraction := 0;
+    else
+      NEW.worked_minutes := round(extract(epoch from (NEW.time_out - NEW.time_in)) / 60)::int;
+      if NEW.worked_minutes < 0 then
+        raise exception 'Clock-out time must be after clock-in time.';
+      end if;
+      NEW.day_fraction      := round(least(NEW.worked_minutes / 480.0, 1.0)::numeric, 2);
+      NEW.overtime_fraction := round(greatest(NEW.worked_minutes / 480.0 - 1.0, 0)::numeric, 2);
+    end if;
+  else
+    NEW.worked_minutes    := null;
+    NEW.day_fraction      := null;
+    NEW.overtime_fraction := 0;
   end if;
   return NEW;
 end;
-$$ language plpgsql security definer;
+$$ language plpgsql;
 
-create trigger trg_guard_overtime_write
-before insert or update on overtime_credits
-for each row execute function guard_overtime_write();
+create trigger trg_compute_attendance_hours
+before insert or update on attendance
+for each row execute function compute_attendance_hours();
 
 -- ============================================================================
 -- Payroll: effective working days + calculated salary
 -- ============================================================================
 
 -- Per-date effective-day value for each attendance status, per the agreed
--- rule (present/paid leave = 1, half-day paid leave = 1 [half worked +
--- half paid], half-day unpaid leave = 0.5 [half worked only], half-day
--- no-notice = 0.25, full no-notice absence = -0.5 net [0 for the missed
--- day, minus an extra 0.5-day penalty]). Overtime never gets a separate
--- line here -- it only tops up the paid-leave balance; the Present day it
--- rides on is already counted at 1.0.
+-- rule ('present' uses the actual worked fraction from clock-in/clock-out,
+-- capped at 1.0 -- see compute_attendance_hours(); paid leave = 1, half-day
+-- paid leave = 1 [half worked + half paid], half-day unpaid leave = 0.5
+-- [half worked only], half-day no-notice = 0.25, full no-notice absence =
+-- -0.5 net [0 for the missed day, minus an extra 0.5-day penalty]).
+-- Overtime never gets a separate line here -- it only tops up the paid-leave
+-- balance; the Present day it rides on is already capped at 1.0.
 create or replace function effective_working_days(p_staff_id uuid, p_year int, p_month int)
 returns table(effective_days numeric, marked_days int, unmarked_days int, total_days int) as $$
 declare
@@ -565,7 +588,7 @@ begin
 
   select count(*), coalesce(sum(
     case status
-      when 'present'                  then 1.0
+      when 'present'                  then coalesce(day_fraction, 1.0)
       when 'approved_paid_leave'      then 1.0
       when 'approved_unpaid_leave'    then 0.0
       when 'half_day_approved_paid'   then 1.0
@@ -741,20 +764,37 @@ create trigger trg_notify_notable_attendance
 after insert or update on attendance
 for each row execute function notify_notable_attendance();
 
--- Overtime logged.
+-- Overtime is now auto-detected from clock-in/clock-out (see
+-- compute_attendance_hours()) rather than logged through its own table, so
+-- this fires off the attendance row itself: whenever a 'present' day ends
+-- up with a positive overtime_fraction that's new or has changed (covers
+-- both the original clock-out and any later time correction), the owner
+-- gets notified, same as the old manual "Log Overtime" button did.
 create or replace function notify_overtime_logged() returns trigger as $$
 declare
   staff_name text;
 begin
+  if coalesce(current_setting('app.system_write', true), 'false') = 'true' then
+    return NEW; -- system write from leave sync, not a real marking action
+  end if;
+  if NEW.status <> 'present' or NEW.overtime_fraction <= 0 then
+    return NEW;
+  end if;
+  if TG_OP = 'UPDATE' and OLD.overtime_fraction = NEW.overtime_fraction then
+    return NEW; -- already notified for this exact amount
+  end if;
+
   select full_name into staff_name from profiles where id = NEW.staff_id;
   insert into notifications (type, staff_id, message, related_id)
-  values ('overtime_logged', NEW.staff_id, coalesce(staff_name, 'A staff member') || ' logged overtime for ' || NEW.date, NEW.id);
+  values ('overtime_logged', NEW.staff_id,
+    coalesce(staff_name, 'A staff member') || ' logged ' || NEW.overtime_fraction || ' day(s) of overtime for ' || NEW.date,
+    NEW.id);
   return NEW;
 end;
 $$ language plpgsql security definer;
 
 create trigger trg_notify_overtime_logged
-after insert on overtime_credits
+after insert or update on attendance
 for each row execute function notify_overtime_logged();
 
 -- Owner manually adjusted someone's paid-leave balance.
@@ -783,7 +823,6 @@ for each row execute function notify_balance_adjusted();
 alter table profiles enable row level security;
 alter table staff_salary enable row level security;
 alter table attendance enable row level security;
-alter table overtime_credits enable row level security;
 alter table leave_balance_adjustments enable row level security;
 alter table leave_requests enable row level security;
 alter table leave_request_days enable row level security;
@@ -820,22 +859,6 @@ create policy "marker_update_attendance" on attendance for update
   using (app_role() = 'marker');
 
 create policy "staff_read_own_attendance" on attendance for select
-  using (staff_id = auth.uid());
-
--- overtime_credits -------------------------------------------------------------
-create policy "owner_all_overtime" on overtime_credits for all
-  using (app_role() = 'owner');
-
-create policy "marker_read_overtime" on overtime_credits for select
-  using (app_role() = 'marker');
-
-create policy "marker_write_overtime" on overtime_credits for insert
-  with check (app_role() = 'marker');
-
-create policy "marker_update_overtime" on overtime_credits for update
-  using (app_role() = 'marker');
-
-create policy "staff_read_own_overtime" on overtime_credits for select
   using (staff_id = auth.uid());
 
 -- leave_balance_adjustments -- owner-only, staff can see their own ------------
@@ -916,7 +939,7 @@ begin
   elsif p_type in ('absent_no_notice', 'half_day_no_notice') then
     select date into v_date from attendance where id = p_related_id;
   elsif p_type = 'overtime_logged' then
-    select date into v_date from overtime_credits where id = p_related_id;
+    select date into v_date from attendance where id = p_related_id;
   elsif p_type = 'balance_adjusted' then
     select (make_date(year, month, 1) + interval '1 month - 1 day')::date into v_date
     from leave_balance_adjustments where id = p_related_id;

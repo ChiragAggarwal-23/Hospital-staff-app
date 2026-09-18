@@ -75,6 +75,41 @@ const ATTENDANCE_LABELS = {
   half_day_approved_unpaid: { label: "Half-day Unpaid Leave", cls: "badge-unpaid" },
 };
 
+// "HH:MM:SS" (from the DB) or "HH:MM" (from a time input) -> "8:00 AM"
+function fmtTime(t) {
+  if (!t) return "";
+  const [h, m] = t.split(":").map(Number);
+  const period = h >= 12 ? "PM" : "AM";
+  const h12 = ((h + 11) % 12) + 1;
+  return `${h12}:${String(m).padStart(2, "0")} ${period}`;
+}
+
+function fmtDuration(mins) {
+  if (mins == null) return "";
+  const h = Math.floor(mins / 60), m = Math.round(mins % 60);
+  return `${h}h${m ? " " + m + "m" : ""}`;
+}
+
+// A 'present' attendance row's label/badge/short-code, derived from its
+// actual clock-in/clock-out -- not yet clocked out ("on duty"), short of 8h
+// ("Short day"), more than 8h ("Overtime" -- day itself still caps at 1.0,
+// the extra goes to paid leave), or exactly 8h ("Present").
+function presentInfo(row) {
+  if (!row.time_out) {
+    return { label: `On duty since ${fmtTime(row.time_in)}`, cls: "badge-present", short: "OD" };
+  }
+  const dur = fmtDuration(row.worked_minutes);
+  const frac = Number(row.day_fraction ?? 1);
+  const ot = Number(row.overtime_fraction ?? 0);
+  if (ot > 0) {
+    return { label: `Overtime · ${dur} · ${(frac + ot).toFixed(2)}d (+${ot.toFixed(2)} leave)`, cls: "badge-overtime", short: "OT" };
+  }
+  if (frac < 1) {
+    return { label: `Short day · ${dur} · ${frac.toFixed(2)}`, cls: "badge-half", short: "SD" };
+  }
+  return { label: `Present · ${dur}`, cls: "badge-present", short: "P" };
+}
+
 function leaveDayBadge(portion, type) {
   if (portion === "half" && type === "paid") return ATTENDANCE_LABELS.half_day_approved_paid;
   if (portion === "half" && type === "unpaid") return ATTENDANCE_LABELS.half_day_approved_unpaid;
@@ -517,51 +552,54 @@ async function renderDailyAttendance(el, { isOwner }) {
     renderDailyAttendance(el, { isOwner });
   });
 
-  const [{ data: staffList, error: staffErr }, { data: attendance }, { data: leaveDays }, { data: overtimeRows }] = await Promise.all([
+  const [{ data: staffList, error: staffErr }, { data: attendance }, { data: leaveDays }] = await Promise.all([
     sb.from("profiles").select("id, full_name, employee_code").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
-    sb.from("attendance").select("staff_id, status").eq("date", dateStr),
+    sb.from("attendance").select("staff_id, status, time_in, time_out, worked_minutes, day_fraction, overtime_fraction").eq("date", dateStr),
     sb.from("leave_request_days").select("staff_id, day_portion, type").eq("date", dateStr).eq("day_status", "active"),
-    sb.from("overtime_credits").select("staff_id, day_portion").eq("date", dateStr),
   ]);
 
   const listEl = $("#staff-list", el);
   if (staffErr) { listEl.innerHTML = `<div class="error-text">${escapeHtml(staffErr.message)}</div>`; return; }
 
-  const attByStaff = Object.fromEntries((attendance || []).map((a) => [a.staff_id, a.status]));
+  const attByStaff = Object.fromEntries((attendance || []).map((a) => [a.staff_id, a]));
   const leaveByStaff = Object.fromEntries((leaveDays || []).map((l) => [l.staff_id, l]));
-  const overtimeByStaff = Object.fromEntries((overtimeRows || []).map((o) => [o.staff_id, o]));
   const isFutureOrToday = dateStr >= todayStr();
 
   listEl.innerHTML = (staffList || []).map((s) => {
     const locked = leaveByStaff[s.id];
-    const currentStatus = attByStaff[s.id];
-    const overtime = overtimeByStaff[s.id];
+    const att = attByStaff[s.id];
+    const currentStatus = att?.status;
+    const isPresent = currentStatus === "present";
     let badgeHtml = `<span class="badge badge-none">Not marked</span>`;
     if (locked) {
       const b = leaveDayBadge(locked.day_portion, locked.type);
       badgeHtml = `<span class="badge ${b.cls}">${b.label}</span>`;
+    } else if (isPresent) {
+      const p = presentInfo(att);
+      badgeHtml = `<span class="badge ${p.cls}">${p.label}</span>`;
     } else if (currentStatus) {
       const b = ATTENDANCE_LABELS[currentStatus];
       badgeHtml = `<span class="badge ${b.cls}">${b.label}</span>`;
     }
-    if (overtime) {
-      badgeHtml += ` <span class="badge badge-overtime">Overtime${overtime.day_portion === "full" ? " (Full)" : ""}</span>`;
-    }
 
     const canEdit = !locked || isOwner;
-    const showOvertimeBtn = !locked && currentStatus === "present" && !overtime;
+    const showClockIn = canEdit && !isPresent;
+    const showClockOut = canEdit && isPresent && att.time_in && !att.time_out;
+    const showEditTimes = canEdit && isPresent && att.time_in;
     const showUnmarkBtn = isOwner && locked && isFutureOrToday;
     let actions = "";
     if (canEdit) {
       actions = `
-        <div class="action-group" data-staff="${s.id}" data-name="${escapeHtml(s.full_name)}" data-locked="${locked ? "1" : ""}">
+        <div class="action-group" data-staff="${s.id}" data-name="${escapeHtml(s.full_name)}" data-locked="${locked ? "1" : ""}"
+             data-time-in="${att?.time_in || ""}" data-time-out="${att?.time_out || ""}">
           ${locked ? `<div class="hint-text" style="margin-bottom:4px;">Any action below will cancel the approved leave on this date and restore the balance.</div>` : ""}
-          <button class="btn btn-outline btn-small act-present">Present</button>
+          ${showClockIn ? `<button class="btn btn-outline btn-small act-clock-in">Clock in</button>` : ""}
+          ${showClockOut ? `<button class="btn btn-outline btn-small act-clock-out">Clock out</button>` : ""}
+          ${showEditTimes ? `<button class="btn btn-outline btn-small act-edit-times">Edit times</button>` : ""}
           <button class="btn btn-outline btn-small act-half-notice">Half-day (No notice)</button>
           <button class="btn btn-outline btn-small act-absent">Absent (No notice)</button>
           <button class="btn btn-outline btn-small act-paid">Log Paid Leave</button>
           <button class="btn btn-outline btn-small act-unpaid">Log Unpaid Leave</button>
-          ${showOvertimeBtn ? `<button class="btn btn-outline btn-small act-overtime">Log Overtime</button>` : ""}
           ${showUnmarkBtn ? `<button class="btn btn-outline btn-small act-unmark">Cancel leave (leave unmarked)</button>` : ""}
         </div>`;
     }
@@ -583,13 +621,16 @@ async function renderDailyAttendance(el, { isOwner }) {
     const staffId = grp.dataset.staff;
     const staffName = grp.dataset.name;
     const wasLocked = grp.dataset.locked === "1";
+    const timeIn = grp.dataset.timeIn || null;
+    const timeOut = grp.dataset.timeOut || null;
     const btn = (sel) => $(sel, grp);
-    if (btn(".act-present")) btn(".act-present").onclick = () => confirmedMarkAttendance(staffId, staffName, "present", dateStr, el, isOwner, wasLocked);
+    if (btn(".act-clock-in")) btn(".act-clock-in").onclick = () => confirmedClockIn(staffId, staffName, dateStr, el, isOwner, wasLocked);
+    if (btn(".act-clock-out")) btn(".act-clock-out").onclick = () => handleClockOut(staffId, staffName, dateStr, el, isOwner, timeIn);
+    if (btn(".act-edit-times")) btn(".act-edit-times").onclick = () => handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut);
     if (btn(".act-half-notice")) btn(".act-half-notice").onclick = () => confirmedMarkAttendance(staffId, staffName, "half_day_no_notice", dateStr, el, isOwner, wasLocked);
     if (btn(".act-absent")) btn(".act-absent").onclick = () => confirmedMarkAttendance(staffId, staffName, "absent_no_notice", dateStr, el, isOwner, wasLocked);
     if (btn(".act-paid")) btn(".act-paid").onclick = () => confirmedLogLeave(staffId, staffName, dateStr, "paid", isOwner, el, wasLocked);
     if (btn(".act-unpaid")) btn(".act-unpaid").onclick = () => confirmedLogLeave(staffId, staffName, dateStr, "unpaid", isOwner, el, wasLocked);
-    if (btn(".act-overtime")) btn(".act-overtime").onclick = () => logOvertimeQuick(staffId, staffName, dateStr, el, isOwner);
     if (btn(".act-unmark")) btn(".act-unmark").onclick = () => confirmedCancelUnmark(staffId, staffName, dateStr, el, isOwner);
   });
 }
@@ -687,17 +728,63 @@ async function logLeaveQuick(staffId, staffName, dateStr, type, isOwner, el, was
   renderDailyAttendance(el, { isOwner });
 }
 
-async function logOvertimeQuick(staffId, staffName, dateStr, el, isOwner) {
-  const result = await openModal(`Log Overtime — ${staffName}`, `
-    <p class="hint-text">Logs a half-day overtime credit for ${escapeHtml(dateStr)} (on top of the full day already worked). Adds 0.5 to this month's paid-leave balance.</p>
-    <label>Note (optional)</label>
-    <textarea name="reason" placeholder="optional note"></textarea>
-  `);
-  if (!result) return;
-  const { error } = await sb.from("overtime_credits").upsert(
-    { staff_id: staffId, date: dateStr, day_portion: "half", reason: result.reason || null, recorded_by: profile.id },
+// Clock in/out is never taken from the device's clock -- the marker always
+// picks the time explicitly, same confirm-first-if-locked pattern as the
+// other override actions above.
+async function confirmedClockIn(staffId, staffName, dateStr, el, isOwner, wasLocked) {
+  if (wasLocked) {
+    const ok = await confirmAction(`This will cancel ${staffName}'s approved leave on ${fmtDateNice(dateStr)} and clock them in instead. Continue?`);
+    if (!ok) return;
+  }
+  await clockInQuick(staffId, staffName, dateStr, el, isOwner, wasLocked);
+}
+
+async function clockInQuick(staffId, staffName, dateStr, el, isOwner, wasLocked) {
+  const result = await openModal(`Clock in — ${staffName}`, `
+    <label>Time in</label>
+    <input type="time" name="time_in" required />
+  `, "Clock in");
+  if (!result || !result.time_in) return;
+
+  if (wasLocked) {
+    const ok = await cancelLockedLeaveDay(staffId, dateStr);
+    if (!ok) return;
+  }
+
+  const { error } = await sb.from("attendance").upsert(
+    { staff_id: staffId, date: dateStr, status: "present", time_in: result.time_in, time_out: null, marked_by: profile.id, locked_by_leave: false },
     { onConflict: "staff_id,date" }
   );
+  if (error) { alert("Couldn't save: " + error.message); return; }
+  renderDailyAttendance(el, { isOwner });
+}
+
+async function handleClockOut(staffId, staffName, dateStr, el, isOwner, timeIn) {
+  const result = await openModal(`Clock out — ${staffName}`, `
+    <p class="hint-text">Clocked in at ${fmtTime(timeIn)}.</p>
+    <label>Time out</label>
+    <input type="time" name="time_out" required />
+  `, "Clock out");
+  if (!result || !result.time_out) return;
+  const { error } = await sb.from("attendance")
+    .update({ time_out: result.time_out })
+    .eq("staff_id", staffId).eq("date", dateStr);
+  if (error) { alert("Couldn't save: " + error.message); return; }
+  renderDailyAttendance(el, { isOwner });
+}
+
+async function handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut) {
+  const result = await openModal(`Edit times — ${staffName}`, `
+    <label>Time in</label>
+    <input type="time" name="time_in" value="${timeIn ? timeIn.slice(0, 5) : ""}" required />
+    <label>Time out</label>
+    <input type="time" name="time_out" value="${timeOut ? timeOut.slice(0, 5) : ""}" />
+    <p class="hint-text">Leave "Time out" empty if they haven't clocked out yet.</p>
+  `, "Save");
+  if (!result) return;
+  const { error } = await sb.from("attendance")
+    .update({ time_in: result.time_in, time_out: result.time_out || null })
+    .eq("staff_id", staffId).eq("date", dateStr);
   if (error) { alert("Couldn't save: " + error.message); return; }
   renderDailyAttendance(el, { isOwner });
 }
@@ -770,10 +857,9 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
   $("#mo-year", body).addEventListener("change", rerender);
   $("#mo-month", body).addEventListener("change", rerender);
 
-  const [{ data: staffList, error: staffErr }, { data: att }, { data: otRows }] = await Promise.all([
+  const [{ data: staffList, error: staffErr }, { data: att }] = await Promise.all([
     sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
-    sb.from("attendance").select("staff_id, date, status").gte("date", start).lte("date", end),
-    sb.from("overtime_credits").select("staff_id, date").gte("date", start).lte("date", end),
+    sb.from("attendance").select("staff_id, date, status, time_in, time_out, worked_minutes, day_fraction, overtime_fraction").gte("date", start).lte("date", end),
   ]);
 
   const gridEl = $("#mo-grid", body);
@@ -781,10 +867,9 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
   if (!staffList || staffList.length === 0) { gridEl.innerHTML = `<div class="hint-text">No active staff yet.</div>`; return; }
 
   const byStaffDate = {};
-  (att || []).forEach((a) => { byStaffDate[a.staff_id + "|" + a.date] = a.status; });
-  const otSet = new Set((otRows || []).map((o) => o.staff_id + "|" + o.date));
+  (att || []).forEach((a) => { byStaffDate[a.staff_id + "|" + a.date] = a; });
 
-  const shortLabel = { present: "P", half_day_no_notice: "H", absent_no_notice: "A",
+  const shortLabel = { half_day_no_notice: "H", absent_no_notice: "A",
     approved_paid_leave: "PL", approved_unpaid_leave: "UL",
     half_day_approved_paid: "HPL", half_day_approved_unpaid: "HUL" };
 
@@ -798,17 +883,21 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
       style="padding:4px 8px; white-space:nowrap; position:sticky; left:0; background:#fff; border-right:1px solid var(--border); cursor:pointer; color:var(--green-dark); text-decoration:underline;">${escapeHtml(s.full_name)}</td>`;
     for (let d = 1; d <= lastDay; d++) {
       const dStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
-      const status = byStaffDate[s.id + "|" + dStr];
-      const info = status ? ATTENDANCE_LABELS[status] : null;
-      const bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
-      const hasOt = otSet.has(s.id + "|" + dStr);
-      const title = (info ? info.label : "Not marked") + (hasOt ? " + Overtime" : "");
-      html += `<td title="${escapeHtml(title)}" style="background:${bg}; text-align:center; padding:5px 2px; border-radius:4px;">${status ? shortLabel[status] : ""}${hasOt ? `<sup style="color:#8a5a00;">OT</sup>` : ""}</td>`;
+      const row = byStaffDate[s.id + "|" + dStr];
+      let short = "", title = "Not marked", bg = "#f4f6f5";
+      if (row && row.status === "present") {
+        const p = presentInfo(row);
+        short = p.short; title = p.label; bg = cssVarFromClass(p.cls);
+      } else if (row) {
+        const info = ATTENDANCE_LABELS[row.status];
+        short = shortLabel[row.status] || ""; title = info ? info.label : row.status; bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
+      }
+      html += `<td title="${escapeHtml(title)}" style="background:${bg}; text-align:center; padding:5px 2px; border-radius:4px;">${short}</td>`;
     }
     html += `</tr>`;
   });
   html += `</tbody></table>
-    <div class="hint-text" style="margin-top:8px;">P=Present · H=Half-day (no notice) · A=Absent (no notice) · PL=Paid Leave · UL=Unpaid Leave · HPL/HUL=Half-day leave · OT=Overtime logged</div>`;
+    <div class="hint-text" style="margin-top:8px;">P=Present · OD=On duty · SD=Short day · OT=Overtime · H=Half-day (no notice) · A=Absent (no notice) · PL=Paid Leave · UL=Unpaid Leave · HPL/HUL=Half-day leave</div>`;
   gridEl.innerHTML = html;
 
   $all(".mo-staff-name", gridEl).forEach((td) => {
@@ -842,9 +931,8 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
   const showSalary = salaryAccess === "owner" || (salaryAccess === "self" && monthComplete);
   const showBalance = salaryAccess !== "none";
 
-  const [{ data: att }, { data: otRows }, { data: effRows, error: effErr }] = await Promise.all([
-    sb.from("attendance").select("date, status").eq("staff_id", staffId).gte("date", start).lte("date", end),
-    sb.from("overtime_credits").select("date, day_portion").eq("staff_id", staffId).gte("date", start).lte("date", end),
+  const [{ data: att }, { data: effRows, error: effErr }] = await Promise.all([
+    sb.from("attendance").select("date, status, time_in, time_out, worked_minutes, day_fraction, overtime_fraction").eq("staff_id", staffId).gte("date", start).lte("date", end),
     sb.rpc("effective_working_days", { p_staff_id: staffId, p_year: year, p_month: month }),
   ]);
 
@@ -860,8 +948,7 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
     salaryText = salRes.error ? "—" : money(salRes.data);
   }
 
-  const attByDate = Object.fromEntries((att || []).map((a) => [a.date, a.status]));
-  const otByDate = Object.fromEntries((otRows || []).map((o) => [o.date, o]));
+  const attByDate = Object.fromEntries((att || []).map((a) => [a.date, a]));
   const firstWeekday = new Date(year, month - 1, 1).getDay();
   const monthLabel = new Date(year, month - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
   const eff = (effRows && effRows[0]) || {};
@@ -870,14 +957,18 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
   for (let i = 0; i < firstWeekday; i++) cells += `<div></div>`;
   for (let d = 1; d <= lastDay; d++) {
     const dStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
-    const status = attByDate[dStr];
-    const info = status ? ATTENDANCE_LABELS[status] : null;
-    const bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
-    const ot = otByDate[dStr];
+    const row = attByDate[dStr];
+    let label = "", bg = "#f4f6f5";
+    if (row && row.status === "present") {
+      const p = presentInfo(row);
+      label = p.label; bg = cssVarFromClass(p.cls);
+    } else if (row) {
+      const info = ATTENDANCE_LABELS[row.status];
+      label = info ? info.label : row.status; bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
+    }
     cells += `<div class="cal-cell" style="background:${bg}">
       <div class="cal-daynum">${d}</div>
-      <div class="cal-label">${info ? info.label : ""}</div>
-      ${ot ? `<div class="cal-label" style="color:#8a5a00;">OT${ot.day_portion === "full" ? " (Full)" : ""}</div>` : ""}
+      <div class="cal-label">${label}</div>
     </div>`;
   }
 
@@ -938,6 +1029,7 @@ function cssVarFromClass(cls) {
   const map = {
     "badge-present": "#e3f4ec", "badge-absent": "#fdeceb", "badge-half": "#fdf1e0",
     "badge-paid": "#e6eefb", "badge-unpaid": "#f0ecf8", "badge-none": "#f4f6f5",
+    "badge-overtime": "#fdf1d6",
   };
   return map[cls] || "#f4f6f5";
 }
