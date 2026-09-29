@@ -110,6 +110,63 @@ function presentInfo(row) {
   return { label: `Present · ${dur}`, cls: "badge-present", short: "P" };
 }
 
+// The real clock times, for display alongside the salary-driven label
+// above. Falls back to the salary time on whichever side has no override --
+// a blank actual_time_in/out means "same as the salary time", so this
+// always reflects what really happened either way.
+function actualTimesLabel(row) {
+  const inT = row.actual_time_in || row.time_in;
+  const outT = row.actual_time_out || row.time_out;
+  if (!inT) return "";
+  if (!outT) return `Actual: since ${fmtTime(inT)}`;
+  return `Actual: ${fmtTime(inT)} – ${fmtTime(outT)}`;
+}
+
+// Small shared tooltip for showing "actual time" details on compact
+// attendance cells (the Monthly Overview grid, personal calendars) -- works
+// on both hover (desktop) and tap (mobile, which has no hover at all).
+let attendanceTipEl = null;
+function ensureAttendanceTip() {
+  if (attendanceTipEl) return attendanceTipEl;
+  attendanceTipEl = document.createElement("div");
+  attendanceTipEl.style.cssText = "position:fixed; z-index:200; background:#2b332f; color:#fff; font-size:12px; " +
+    "padding:6px 10px; border-radius:6px; pointer-events:none; display:none; max-width:220px; " +
+    "box-shadow:0 4px 14px rgba(0,0,0,0.25); white-space:nowrap;";
+  document.body.appendChild(attendanceTipEl);
+  document.addEventListener("click", () => { attendanceTipEl.style.display = "none"; });
+  window.addEventListener("scroll", () => { attendanceTipEl.style.display = "none"; }, true);
+  return attendanceTipEl;
+}
+function showAttendanceTip(anchor, text) {
+  if (!text) return;
+  const tip = ensureAttendanceTip();
+  tip.textContent = text;
+  tip.style.display = "block";
+  const r = anchor.getBoundingClientRect();
+  let top = r.top - tip.offsetHeight - 8;
+  if (top < 4) top = r.bottom + 8; // flip below if there's no room above
+  let left = r.left + r.width / 2 - tip.offsetWidth / 2;
+  left = Math.min(Math.max(4, left), window.innerWidth - tip.offsetWidth - 4);
+  tip.style.top = `${top}px`;
+  tip.style.left = `${left}px`;
+}
+function hideAttendanceTip() {
+  if (attendanceTipEl) attendanceTipEl.style.display = "none";
+}
+// Attaches both hover and tap handling to one element for one tooltip text.
+function wireAttendanceTip(el, text) {
+  if (!text) return;
+  el.style.cursor = "pointer";
+  el.addEventListener("mouseenter", () => showAttendanceTip(el, text));
+  el.addEventListener("mouseleave", hideAttendanceTip);
+  el.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const tip = ensureAttendanceTip();
+    if (tip.style.display === "block" && tip.textContent === text) hideAttendanceTip();
+    else showAttendanceTip(el, text);
+  });
+}
+
 function leaveDayBadge(portion, type) {
   if (portion === "half" && type === "paid") return ATTENDANCE_LABELS.half_day_approved_paid;
   if (portion === "half" && type === "unpaid") return ATTENDANCE_LABELS.half_day_approved_unpaid;
@@ -554,7 +611,7 @@ async function renderDailyAttendance(el, { isOwner }) {
 
   const [{ data: staffList, error: staffErr }, { data: attendance }, { data: leaveDays }] = await Promise.all([
     sb.from("profiles").select("id, full_name, employee_code").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
-    sb.from("attendance").select("staff_id, status, time_in, time_out, worked_minutes, day_fraction, overtime_fraction").eq("date", dateStr),
+    sb.from("attendance").select("staff_id, status, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").eq("date", dateStr),
     sb.from("leave_request_days").select("staff_id, day_portion, type").eq("date", dateStr).eq("day_status", "active"),
   ]);
 
@@ -571,12 +628,15 @@ async function renderDailyAttendance(el, { isOwner }) {
     const currentStatus = att?.status;
     const isPresent = currentStatus === "present";
     let badgeHtml = `<span class="badge badge-none">Not marked</span>`;
+    let actualLine = "";
     if (locked) {
       const b = leaveDayBadge(locked.day_portion, locked.type);
       badgeHtml = `<span class="badge ${b.cls}">${b.label}</span>`;
     } else if (isPresent) {
       const p = presentInfo(att);
       badgeHtml = `<span class="badge ${p.cls}">${p.label}</span>`;
+      const al = actualTimesLabel(att);
+      if (al) actualLine = `<div class="hint-text" style="margin-top:2px;">${escapeHtml(al)}</div>`;
     } else if (currentStatus) {
       const b = ATTENDANCE_LABELS[currentStatus];
       badgeHtml = `<span class="badge ${b.cls}">${b.label}</span>`;
@@ -591,7 +651,8 @@ async function renderDailyAttendance(el, { isOwner }) {
     if (canEdit) {
       actions = `
         <div class="action-group" data-staff="${s.id}" data-name="${escapeHtml(s.full_name)}" data-locked="${locked ? "1" : ""}"
-             data-time-in="${att?.time_in || ""}" data-time-out="${att?.time_out || ""}">
+             data-time-in="${att?.time_in || ""}" data-time-out="${att?.time_out || ""}"
+             data-actual-time-in="${att?.actual_time_in || ""}" data-actual-time-out="${att?.actual_time_out || ""}">
           ${locked ? `<div class="hint-text" style="margin-bottom:4px;">Any action below will cancel the approved leave on this date and restore the balance.</div>` : ""}
           ${showClockIn ? `<button class="btn btn-outline btn-small act-clock-in">Clock in</button>` : ""}
           ${showClockOut ? `<button class="btn btn-outline btn-small act-clock-out">Clock out</button>` : ""}
@@ -612,6 +673,7 @@ async function renderDailyAttendance(el, { isOwner }) {
         </div>
         <div style="text-align:right;">
           ${badgeHtml}
+          ${actualLine}
           ${actions}
         </div>
       </div>`;
@@ -623,10 +685,12 @@ async function renderDailyAttendance(el, { isOwner }) {
     const wasLocked = grp.dataset.locked === "1";
     const timeIn = grp.dataset.timeIn || null;
     const timeOut = grp.dataset.timeOut || null;
+    const actualTimeIn = grp.dataset.actualTimeIn || null;
+    const actualTimeOut = grp.dataset.actualTimeOut || null;
     const btn = (sel) => $(sel, grp);
     if (btn(".act-clock-in")) btn(".act-clock-in").onclick = () => confirmedClockIn(staffId, staffName, dateStr, el, isOwner, wasLocked);
-    if (btn(".act-clock-out")) btn(".act-clock-out").onclick = () => handleClockOut(staffId, staffName, dateStr, el, isOwner, timeIn);
-    if (btn(".act-edit-times")) btn(".act-edit-times").onclick = () => handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut);
+    if (btn(".act-clock-out")) btn(".act-clock-out").onclick = () => handleClockOut(staffId, staffName, dateStr, el, isOwner, timeIn, actualTimeIn);
+    if (btn(".act-edit-times")) btn(".act-edit-times").onclick = () => handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut, actualTimeIn, actualTimeOut);
     if (btn(".act-half-notice")) btn(".act-half-notice").onclick = () => confirmedMarkAttendance(staffId, staffName, "half_day_no_notice", dateStr, el, isOwner, wasLocked);
     if (btn(".act-absent")) btn(".act-absent").onclick = () => confirmedMarkAttendance(staffId, staffName, "absent_no_notice", dateStr, el, isOwner, wasLocked);
     if (btn(".act-paid")) btn(".act-paid").onclick = () => confirmedLogLeave(staffId, staffName, dateStr, "paid", isOwner, el, wasLocked);
@@ -741,8 +805,11 @@ async function confirmedClockIn(staffId, staffName, dateStr, el, isOwner, wasLoc
 
 async function clockInQuick(staffId, staffName, dateStr, el, isOwner, wasLocked) {
   const result = await openModal(`Clock in — ${staffName}`, `
-    <label>Time in</label>
+    <label>Time in (used for salary)</label>
     <input type="time" name="time_in" required />
+    <label>Actual time in (only if different)</label>
+    <input type="time" name="actual_time_in" />
+    <p class="hint-text">Leave "Actual time in" blank if they clocked in right at the salary time above -- fill it in only when leniency is being applied (e.g. salary time 8:00 AM, actually arrived 8:15 AM).</p>
   `, "Clock in");
   if (!result || !result.time_in) return;
 
@@ -752,38 +819,50 @@ async function clockInQuick(staffId, staffName, dateStr, el, isOwner, wasLocked)
   }
 
   const { error } = await sb.from("attendance").upsert(
-    { staff_id: staffId, date: dateStr, status: "present", time_in: result.time_in, time_out: null, marked_by: profile.id, locked_by_leave: false },
+    { staff_id: staffId, date: dateStr, status: "present", time_in: result.time_in, time_out: null,
+      actual_time_in: result.actual_time_in || null, actual_time_out: null,
+      marked_by: profile.id, locked_by_leave: false },
     { onConflict: "staff_id,date" }
   );
   if (error) { alert("Couldn't save: " + error.message); return; }
   renderDailyAttendance(el, { isOwner });
 }
 
-async function handleClockOut(staffId, staffName, dateStr, el, isOwner, timeIn) {
+async function handleClockOut(staffId, staffName, dateStr, el, isOwner, timeIn, actualTimeIn) {
+  const inNote = actualTimeIn && actualTimeIn !== timeIn ? ` (actual: ${fmtTime(actualTimeIn)})` : "";
   const result = await openModal(`Clock out — ${staffName}`, `
-    <p class="hint-text">Clocked in at ${fmtTime(timeIn)}.</p>
-    <label>Time out</label>
+    <p class="hint-text">Clocked in at ${fmtTime(timeIn)}${inNote}.</p>
+    <label>Time out (used for salary)</label>
     <input type="time" name="time_out" required />
+    <label>Actual time out (only if different)</label>
+    <input type="time" name="actual_time_out" />
   `, "Clock out");
   if (!result || !result.time_out) return;
   const { error } = await sb.from("attendance")
-    .update({ time_out: result.time_out })
+    .update({ time_out: result.time_out, actual_time_out: result.actual_time_out || null })
     .eq("staff_id", staffId).eq("date", dateStr);
   if (error) { alert("Couldn't save: " + error.message); return; }
   renderDailyAttendance(el, { isOwner });
 }
 
-async function handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut) {
+async function handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut, actualTimeIn, actualTimeOut) {
   const result = await openModal(`Edit times — ${staffName}`, `
-    <label>Time in</label>
+    <label>Time in (used for salary)</label>
     <input type="time" name="time_in" value="${timeIn ? timeIn.slice(0, 5) : ""}" required />
-    <label>Time out</label>
+    <label>Actual time in (only if different)</label>
+    <input type="time" name="actual_time_in" value="${actualTimeIn ? actualTimeIn.slice(0, 5) : ""}" />
+    <label>Time out (used for salary)</label>
     <input type="time" name="time_out" value="${timeOut ? timeOut.slice(0, 5) : ""}" />
-    <p class="hint-text">Leave "Time out" empty if they haven't clocked out yet.</p>
+    <label>Actual time out (only if different)</label>
+    <input type="time" name="actual_time_out" value="${actualTimeOut ? actualTimeOut.slice(0, 5) : ""}" />
+    <p class="hint-text">Leave "Time out" empty if they haven't clocked out yet. Leave the "Actual" fields empty if they match the salary times above.</p>
   `, "Save");
   if (!result) return;
   const { error } = await sb.from("attendance")
-    .update({ time_in: result.time_in, time_out: result.time_out || null })
+    .update({
+      time_in: result.time_in, time_out: result.time_out || null,
+      actual_time_in: result.actual_time_in || null, actual_time_out: result.actual_time_out || null,
+    })
     .eq("staff_id", staffId).eq("date", dateStr);
   if (error) { alert("Couldn't save: " + error.message); return; }
   renderDailyAttendance(el, { isOwner });
@@ -859,7 +938,7 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
 
   const [{ data: staffList, error: staffErr }, { data: att }] = await Promise.all([
     sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
-    sb.from("attendance").select("staff_id, date, status, time_in, time_out, worked_minutes, day_fraction, overtime_fraction").gte("date", start).lte("date", end),
+    sb.from("attendance").select("staff_id, date, status, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").gte("date", start).lte("date", end),
   ]);
 
   const gridEl = $("#mo-grid", body);
@@ -884,21 +963,25 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
     for (let d = 1; d <= lastDay; d++) {
       const dStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
       const row = byStaffDate[s.id + "|" + dStr];
-      let short = "", title = "Not marked", bg = "#f4f6f5";
+      let short = "", title = "Not marked", bg = "#f4f6f5", actualText = "";
       if (row && row.status === "present") {
         const p = presentInfo(row);
         short = p.short; title = p.label; bg = cssVarFromClass(p.cls);
+        actualText = actualTimesLabel(row);
       } else if (row) {
         const info = ATTENDANCE_LABELS[row.status];
         short = shortLabel[row.status] || ""; title = info ? info.label : row.status; bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
       }
-      html += `<td title="${escapeHtml(title)}" style="background:${bg}; text-align:center; padding:5px 2px; border-radius:4px;">${short}</td>`;
+      const tipAttr = actualText ? ` class="mo-cell-tip" data-tip="${escapeHtml(actualText)}"` : "";
+      html += `<td title="${escapeHtml(title)}"${tipAttr} style="background:${bg}; text-align:center; padding:5px 2px; border-radius:4px;">${short}</td>`;
     }
     html += `</tr>`;
   });
   html += `</tbody></table>
-    <div class="hint-text" style="margin-top:8px;">P=Present · OD=On duty · SD=Short day · OT=Overtime · H=Half-day (no notice) · A=Absent (no notice) · PL=Paid Leave · UL=Unpaid Leave · HPL/HUL=Half-day leave</div>`;
+    <div class="hint-text" style="margin-top:8px;">P=Present · OD=On duty · SD=Short day · OT=Overtime · H=Half-day (no notice) · A=Absent (no notice) · PL=Paid Leave · UL=Unpaid Leave · HPL/HUL=Half-day leave · tap or hover a Present/Short day/Overtime cell to see actual clock times</div>`;
   gridEl.innerHTML = html;
+
+  $all(".mo-cell-tip", gridEl).forEach((td) => wireAttendanceTip(td, td.dataset.tip));
 
   $all(".mo-staff-name", gridEl).forEach((td) => {
     td.onclick = () => {
@@ -932,7 +1015,7 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
   const showBalance = salaryAccess !== "none";
 
   const [{ data: att }, { data: effRows, error: effErr }] = await Promise.all([
-    sb.from("attendance").select("date, status, time_in, time_out, worked_minutes, day_fraction, overtime_fraction").eq("staff_id", staffId).gte("date", start).lte("date", end),
+    sb.from("attendance").select("date, status, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").eq("staff_id", staffId).gte("date", start).lte("date", end),
     sb.rpc("effective_working_days", { p_staff_id: staffId, p_year: year, p_month: month }),
   ]);
 
@@ -958,15 +1041,17 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
   for (let d = 1; d <= lastDay; d++) {
     const dStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
     const row = attByDate[dStr];
-    let label = "", bg = "#f4f6f5";
+    let label = "", bg = "#f4f6f5", actualText = "";
     if (row && row.status === "present") {
       const p = presentInfo(row);
       label = p.label; bg = cssVarFromClass(p.cls);
+      actualText = actualTimesLabel(row);
     } else if (row) {
       const info = ATTENDANCE_LABELS[row.status];
       label = info ? info.label : row.status; bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
     }
-    cells += `<div class="cal-cell" style="background:${bg}">
+    const tipAttr = actualText ? ` data-tip="${escapeHtml(actualText)}"` : "";
+    cells += `<div class="cal-cell${actualText ? " cal-cell-tip" : ""}" style="background:${bg}"${tipAttr}>
       <div class="cal-daynum">${d}</div>
       <div class="cal-label">${label}</div>
     </div>`;
@@ -1006,6 +1091,7 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
   `;
 
   if (onBack) $("#cal-back", el).onclick = onBack;
+  $all(".cal-cell-tip", el).forEach((cell) => wireAttendanceTip(cell, cell.dataset.tip));
 
   function goTo(y, m) {
     el.dataset.year = y; el.dataset.month = m;

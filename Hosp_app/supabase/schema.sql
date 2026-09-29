@@ -86,8 +86,16 @@ create table attendance (
   staff_id         uuid not null references profiles(id) on delete cascade,
   date             date not null,
   status           attendance_status not null,
+  -- time_in / time_out are what salary is actually calculated from (e.g.
+  -- the leniently-rounded 8:00 AM for someone who really arrived at 8:15).
+  -- actual_time_in / actual_time_out are purely an informational log of
+  -- what really happened -- never read by any payroll function -- and are
+  -- left null whenever they'd just match time_in/time_out (i.e. no
+  -- leniency was applied that day).
   time_in          time,
   time_out         time,
+  actual_time_in   time,
+  actual_time_out  time,
   -- Populated by compute_attendance_hours() below whenever status = 'present'.
   -- worked_minutes is null until both time_in and time_out are set; a
   -- clock-in with no clock-out yet is treated as a full day for payroll
@@ -543,7 +551,11 @@ begin
     else
       NEW.worked_minutes := round(extract(epoch from (NEW.time_out - NEW.time_in)) / 60)::int;
       if NEW.worked_minutes < 0 then
-        raise exception 'Clock-out time must be after clock-in time.';
+        -- Overnight shift (e.g. 8 PM in, 8 AM out): time_out is technically
+        -- "earlier" than time_in on the clock, but really means the next
+        -- calendar day. Wrap it forward 24h and count the whole shift on
+        -- the date duty started, rather than treating it as an error.
+        NEW.worked_minutes := NEW.worked_minutes + 1440;
       end if;
       NEW.day_fraction      := round(least(NEW.worked_minutes / 480.0, 1.0)::numeric, 2);
       NEW.overtime_fraction := round(greatest(NEW.worked_minutes / 480.0 - 1.0, 0)::numeric, 2);
