@@ -65,6 +65,14 @@ function money(n) {
   return "₹" + Number(n).toLocaleString("en-IN");
 }
 
+// Shift type only changes the payroll math for 'night' (12h base instead of
+// 8h, see compute_attendance_hours() in the DB) -- it's otherwise just
+// recorded for the Morning/Evening/Night mix shown in Monthly Overview.
+const SHIFT_LABELS = { morning: "Morning duty", evening: "Evening duty", night: "Night duty" };
+function shiftTypeLabel(row) {
+  return row && row.shift_type ? (SHIFT_LABELS[row.shift_type] || "") : "";
+}
+
 const ATTENDANCE_LABELS = {
   present: { label: "Present", cls: "badge-present" },
   half_day_no_notice: { label: "Half-day (No notice)", cls: "badge-half" },
@@ -120,6 +128,13 @@ function actualTimesLabel(row) {
   if (!inT) return "";
   if (!outT) return `Actual: since ${fmtTime(inT)}`;
   return `Actual: ${fmtTime(inT)} – ${fmtTime(outT)}`;
+}
+
+// Combined tooltip text for a compact present-day cell (Monthly Overview
+// grid, personal calendar): shift type + actual clock times, whichever of
+// the two apply. Used wherever wireAttendanceTip() is attached below.
+function cellTipText(row) {
+  return [shiftTypeLabel(row), actualTimesLabel(row)].filter(Boolean).join(" · ");
 }
 
 // Small shared tooltip for showing "actual time" details on compact
@@ -227,6 +242,21 @@ const MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
 function monthSelectHtml(id, selectedMonth) {
   return `<select id="${id}">${MONTH_NAMES.map((name, i) =>
     `<option value="${i + 1}" ${i + 1 === selectedMonth ? "selected" : ""}>${name}</option>`
+  ).join("")}</select>`;
+}
+
+// Shift selector used on the clock-in and edit-times modals. Pre-selects
+// Morning by default (per the agreed design: not auto-guessed from the time
+// entered, so the marker has to consciously pick Night rather than risk
+// forgetting to untick an auto-guess).
+const SHIFT_OPTIONS = [
+  ["morning", "Morning duty (8h)"],
+  ["evening", "Evening duty (8h)"],
+  ["night", "Night duty (12h)"],
+];
+function shiftSelectHtml(selected = "morning") {
+  return `<select name="shift_type">${SHIFT_OPTIONS.map(([v, l]) =>
+    `<option value="${v}" ${v === selected ? "selected" : ""}>${l}</option>`
   ).join("")}</select>`;
 }
 
@@ -611,7 +641,7 @@ async function renderDailyAttendance(el, { isOwner }) {
 
   const [{ data: staffList, error: staffErr }, { data: attendance }, { data: leaveDays }] = await Promise.all([
     sb.from("profiles").select("id, full_name, employee_code").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
-    sb.from("attendance").select("staff_id, status, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").eq("date", dateStr),
+    sb.from("attendance").select("staff_id, status, shift_type, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").eq("date", dateStr),
     sb.from("leave_request_days").select("staff_id, day_portion, type").eq("date", dateStr).eq("day_status", "active"),
   ]);
 
@@ -634,7 +664,8 @@ async function renderDailyAttendance(el, { isOwner }) {
       badgeHtml = `<span class="badge ${b.cls}">${b.label}</span>`;
     } else if (isPresent) {
       const p = presentInfo(att);
-      badgeHtml = `<span class="badge ${p.cls}">${p.label}</span>`;
+      const sl = shiftTypeLabel(att);
+      badgeHtml = `<span class="badge ${p.cls}">${p.label}</span>${sl ? ` <span class="badge badge-none">${escapeHtml(sl)}</span>` : ""}`;
       const al = actualTimesLabel(att);
       if (al) actualLine = `<div class="hint-text" style="margin-top:2px;">${escapeHtml(al)}</div>`;
     } else if (currentStatus) {
@@ -652,7 +683,8 @@ async function renderDailyAttendance(el, { isOwner }) {
       actions = `
         <div class="action-group" data-staff="${s.id}" data-name="${escapeHtml(s.full_name)}" data-locked="${locked ? "1" : ""}"
              data-time-in="${att?.time_in || ""}" data-time-out="${att?.time_out || ""}"
-             data-actual-time-in="${att?.actual_time_in || ""}" data-actual-time-out="${att?.actual_time_out || ""}">
+             data-actual-time-in="${att?.actual_time_in || ""}" data-actual-time-out="${att?.actual_time_out || ""}"
+             data-shift-type="${att?.shift_type || "morning"}">
           ${locked ? `<div class="hint-text" style="margin-bottom:4px;">Any action below will cancel the approved leave on this date and restore the balance.</div>` : ""}
           ${showClockIn ? `<button class="btn btn-outline btn-small act-clock-in">Clock in</button>` : ""}
           ${showClockOut ? `<button class="btn btn-outline btn-small act-clock-out">Clock out</button>` : ""}
@@ -687,10 +719,11 @@ async function renderDailyAttendance(el, { isOwner }) {
     const timeOut = grp.dataset.timeOut || null;
     const actualTimeIn = grp.dataset.actualTimeIn || null;
     const actualTimeOut = grp.dataset.actualTimeOut || null;
+    const shiftType = grp.dataset.shiftType || "morning";
     const btn = (sel) => $(sel, grp);
     if (btn(".act-clock-in")) btn(".act-clock-in").onclick = () => confirmedClockIn(staffId, staffName, dateStr, el, isOwner, wasLocked);
     if (btn(".act-clock-out")) btn(".act-clock-out").onclick = () => handleClockOut(staffId, staffName, dateStr, el, isOwner, timeIn, actualTimeIn);
-    if (btn(".act-edit-times")) btn(".act-edit-times").onclick = () => handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut, actualTimeIn, actualTimeOut);
+    if (btn(".act-edit-times")) btn(".act-edit-times").onclick = () => handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut, actualTimeIn, actualTimeOut, shiftType);
     if (btn(".act-half-notice")) btn(".act-half-notice").onclick = () => confirmedMarkAttendance(staffId, staffName, "half_day_no_notice", dateStr, el, isOwner, wasLocked);
     if (btn(".act-absent")) btn(".act-absent").onclick = () => confirmedMarkAttendance(staffId, staffName, "absent_no_notice", dateStr, el, isOwner, wasLocked);
     if (btn(".act-paid")) btn(".act-paid").onclick = () => confirmedLogLeave(staffId, staffName, dateStr, "paid", isOwner, el, wasLocked);
@@ -805,6 +838,8 @@ async function confirmedClockIn(staffId, staffName, dateStr, el, isOwner, wasLoc
 
 async function clockInQuick(staffId, staffName, dateStr, el, isOwner, wasLocked) {
   const result = await openModal(`Clock in — ${staffName}`, `
+    <label>Shift</label>
+    ${shiftSelectHtml("morning")}
     <label>Time in (used for salary)</label>
     <input type="time" name="time_in" required />
     <label>Actual time in (only if different)</label>
@@ -819,7 +854,8 @@ async function clockInQuick(staffId, staffName, dateStr, el, isOwner, wasLocked)
   }
 
   const { error } = await sb.from("attendance").upsert(
-    { staff_id: staffId, date: dateStr, status: "present", time_in: result.time_in, time_out: null,
+    { staff_id: staffId, date: dateStr, status: "present", shift_type: result.shift_type || "morning",
+      time_in: result.time_in, time_out: null,
       actual_time_in: result.actual_time_in || null, actual_time_out: null,
       marked_by: profile.id, locked_by_leave: false },
     { onConflict: "staff_id,date" }
@@ -845,8 +881,10 @@ async function handleClockOut(staffId, staffName, dateStr, el, isOwner, timeIn, 
   renderDailyAttendance(el, { isOwner });
 }
 
-async function handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut, actualTimeIn, actualTimeOut) {
+async function handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn, timeOut, actualTimeIn, actualTimeOut, shiftType) {
   const result = await openModal(`Edit times — ${staffName}`, `
+    <label>Shift</label>
+    ${shiftSelectHtml(shiftType || "morning")}
     <label>Time in (used for salary)</label>
     <input type="time" name="time_in" value="${timeIn ? timeIn.slice(0, 5) : ""}" required />
     <label>Actual time in (only if different)</label>
@@ -860,6 +898,7 @@ async function handleEditTimes(staffId, staffName, dateStr, el, isOwner, timeIn,
   if (!result) return;
   const { error } = await sb.from("attendance")
     .update({
+      shift_type: result.shift_type || "morning",
       time_in: result.time_in, time_out: result.time_out || null,
       actual_time_in: result.actual_time_in || null, actual_time_out: result.actual_time_out || null,
     })
@@ -938,7 +977,7 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
 
   const [{ data: staffList, error: staffErr }, { data: att }] = await Promise.all([
     sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
-    sb.from("attendance").select("staff_id, date, status, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").gte("date", start).lte("date", end),
+    sb.from("attendance").select("staff_id, date, status, shift_type, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").gte("date", start).lte("date", end),
   ]);
 
   const gridEl = $("#mo-grid", body);
@@ -946,7 +985,14 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
   if (!staffList || staffList.length === 0) { gridEl.innerHTML = `<div class="hint-text">No active staff yet.</div>`; return; }
 
   const byStaffDate = {};
-  (att || []).forEach((a) => { byStaffDate[a.staff_id + "|" + a.date] = a; });
+  const shiftCounts = {};
+  (att || []).forEach((a) => {
+    byStaffDate[a.staff_id + "|" + a.date] = a;
+    if (a.status === "present") {
+      const sc = shiftCounts[a.staff_id] || (shiftCounts[a.staff_id] = { morning: 0, evening: 0, night: 0 });
+      sc[a.shift_type] = (sc[a.shift_type] || 0) + 1;
+    }
+  });
 
   const shortLabel = { half_day_no_notice: "H", absent_no_notice: "A",
     approved_paid_leave: "PL", approved_unpaid_leave: "UL",
@@ -958,27 +1004,31 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
     </tr></thead><tbody>`;
 
   staffList.forEach((s) => {
+    const sc = shiftCounts[s.id] || { morning: 0, evening: 0, night: 0 };
     html += `<tr><td class="mo-staff-name" data-staff-id="${s.id}" data-staff-name="${escapeHtml(s.full_name)}"
-      style="padding:4px 8px; white-space:nowrap; position:sticky; left:0; background:#fff; border-right:1px solid var(--border); cursor:pointer; color:var(--green-dark); text-decoration:underline;">${escapeHtml(s.full_name)}</td>`;
+      style="padding:4px 8px; white-space:nowrap; position:sticky; left:0; background:#fff; border-right:1px solid var(--border); cursor:pointer;">
+      <div style="color:var(--green-dark); text-decoration:underline;">${escapeHtml(s.full_name)}</div>
+      <div class="hint-text" style="font-size:10px;">M:${sc.morning} · E:${sc.evening} · N:${sc.night}</div>
+      </td>`;
     for (let d = 1; d <= lastDay; d++) {
       const dStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
       const row = byStaffDate[s.id + "|" + dStr];
-      let short = "", title = "Not marked", bg = "#f4f6f5", actualText = "";
+      let short = "", title = "Not marked", bg = "#f4f6f5", tipText = "";
       if (row && row.status === "present") {
         const p = presentInfo(row);
         short = p.short; title = p.label; bg = cssVarFromClass(p.cls);
-        actualText = actualTimesLabel(row);
+        tipText = cellTipText(row);
       } else if (row) {
         const info = ATTENDANCE_LABELS[row.status];
         short = shortLabel[row.status] || ""; title = info ? info.label : row.status; bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
       }
-      const tipAttr = actualText ? ` class="mo-cell-tip" data-tip="${escapeHtml(actualText)}"` : "";
+      const tipAttr = tipText ? ` class="mo-cell-tip" data-tip="${escapeHtml(tipText)}"` : "";
       html += `<td title="${escapeHtml(title)}"${tipAttr} style="background:${bg}; text-align:center; padding:5px 2px; border-radius:4px;">${short}</td>`;
     }
     html += `</tr>`;
   });
   html += `</tbody></table>
-    <div class="hint-text" style="margin-top:8px;">P=Present · OD=On duty · SD=Short day · OT=Overtime · H=Half-day (no notice) · A=Absent (no notice) · PL=Paid Leave · UL=Unpaid Leave · HPL/HUL=Half-day leave · tap or hover a Present/Short day/Overtime cell to see actual clock times</div>`;
+    <div class="hint-text" style="margin-top:8px;">P=Present · OD=On duty · SD=Short day · OT=Overtime · H=Half-day (no notice) · A=Absent (no notice) · PL=Paid Leave · UL=Unpaid Leave · HPL/HUL=Half-day leave · M/E/N under each name = Morning/Evening/Night shifts this month · tap or hover a Present/Short day/Overtime cell to see shift type and actual clock times</div>`;
   gridEl.innerHTML = html;
 
   $all(".mo-cell-tip", gridEl).forEach((td) => wireAttendanceTip(td, td.dataset.tip));
@@ -1015,7 +1065,7 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
   const showBalance = salaryAccess !== "none";
 
   const [{ data: att }, { data: effRows, error: effErr }] = await Promise.all([
-    sb.from("attendance").select("date, status, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").eq("staff_id", staffId).gte("date", start).lte("date", end),
+    sb.from("attendance").select("date, status, shift_type, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").eq("staff_id", staffId).gte("date", start).lte("date", end),
     sb.rpc("effective_working_days", { p_staff_id: staffId, p_year: year, p_month: month }),
   ]);
 
@@ -1036,22 +1086,25 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
   const monthLabel = new Date(year, month - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
   const eff = (effRows && effRows[0]) || {};
 
+  const shiftCounts = { morning: 0, evening: 0, night: 0 };
+  (att || []).forEach((a) => { if (a.status === "present") shiftCounts[a.shift_type] = (shiftCounts[a.shift_type] || 0) + 1; });
+
   let cells = "";
   for (let i = 0; i < firstWeekday; i++) cells += `<div></div>`;
   for (let d = 1; d <= lastDay; d++) {
     const dStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
     const row = attByDate[dStr];
-    let label = "", bg = "#f4f6f5", actualText = "";
+    let label = "", bg = "#f4f6f5", tipText = "";
     if (row && row.status === "present") {
       const p = presentInfo(row);
       label = p.label; bg = cssVarFromClass(p.cls);
-      actualText = actualTimesLabel(row);
+      tipText = cellTipText(row);
     } else if (row) {
       const info = ATTENDANCE_LABELS[row.status];
       label = info ? info.label : row.status; bg = info ? cssVarFromClass(info.cls) : "#f4f6f5";
     }
-    const tipAttr = actualText ? ` data-tip="${escapeHtml(actualText)}"` : "";
-    cells += `<div class="cal-cell${actualText ? " cal-cell-tip" : ""}" style="background:${bg}"${tipAttr}>
+    const tipAttr = tipText ? ` data-tip="${escapeHtml(tipText)}"` : "";
+    cells += `<div class="cal-cell${tipText ? " cal-cell-tip" : ""}" style="background:${bg}"${tipAttr}>
       <div class="cal-daynum">${d}</div>
       <div class="cal-label">${label}</div>
     </div>`;
@@ -1063,6 +1116,7 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
   const balanceTileHtml = showBalance
     ? `<div class="tile"><div class="num">${balErr ? "—" : Number(balance).toFixed(2)}</div><div class="lbl">Paid leave balance</div></div>` : "";
   const effTileHtml = `<div class="tile"><div class="num">${effErr ? "—" : Number(eff.effective_days ?? 0).toFixed(2)}</div><div class="lbl">Effective working days</div></div>`;
+  const shiftTileHtml = `<div class="tile"><div class="num" style="font-size:15px;">M ${shiftCounts.morning} · E ${shiftCounts.evening} · N ${shiftCounts.night}</div><div class="lbl">Shifts this month</div></div>`;
 
   el.innerHTML = `
     ${onBack ? `<button class="btn btn-outline btn-small" id="cal-back" style="margin-bottom:10px;">&larr; Back to overview</button>` : ""}
@@ -1072,6 +1126,7 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
         ${salaryTileHtml}
         ${balanceTileHtml}
         ${effTileHtml}
+        ${shiftTileHtml}
       </div>
       ${!effErr && eff.unmarked_days ? `<div class="hint-text">${eff.unmarked_days} day(s) not marked yet this month.</div>` : ""}
       ${balErr ? `<div class="error-text">${escapeHtml(balErr.message)}</div>` : ""}

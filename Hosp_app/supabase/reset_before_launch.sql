@@ -2,9 +2,14 @@
 -- ONE-TIME RESET before real staff start using the app.
 --
 -- Wipes every bit of test-phase data (notifications, leave/approval
--- history, adjustments history, attendance, overtime, salary records) and
+-- history, adjustments history, attendance -- clock-in/out times and any
+-- overtime credit live on that same table now -- and salary records) and
 -- every account EXCEPT the 3 test accounts you're keeping. Those 3 stay
 -- completely intact -- same login, same role, still fully usable.
+--
+-- Updated for the clock-in/clock-out migration (migration_6.sql): that
+-- migration removed the old overtime_credits table entirely, so this no
+-- longer deletes from it -- deleting attendance now covers that too.
 --
 -- IRREVERSIBLE -- there is no undo once this runs. Double-check the email
 -- list right below matches your 3 keeper accounts exactly, then run this
@@ -23,9 +28,9 @@ delete from leave_requests;
 -- Adjustments history
 delete from leave_balance_adjustments;
 
--- Attendance, overtime and salary records from the testing phase
+-- Attendance (clock-in/out times, overtime credit) and salary records
+-- from the testing phase
 delete from attendance;
-delete from overtime_credits;
 delete from staff_salary;
 
 -- Every account except the 3 you're keeping. Deleting from auth.users

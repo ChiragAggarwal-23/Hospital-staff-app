@@ -14,6 +14,7 @@ create type day_portion as enum ('full', 'half');
 create type leave_status as enum ('pending', 'approved', 'rejected', 'cancelled');
 create type day_status as enum ('active', 'cancelled');
 create type leave_source as enum ('staff_request', 'marker_logged', 'owner_logged');
+create type shift_type as enum ('morning', 'evening', 'night');
 
 create type attendance_status as enum (
   'present',
@@ -96,13 +97,20 @@ create table attendance (
   time_out         time,
   actual_time_in   time,
   actual_time_out  time,
+  -- Which shift this day's hours belong to. Only changes the payroll math
+  -- for 'night' (a 12h shift base instead of the usual 8h) -- see
+  -- compute_attendance_hours() below. Recorded for every present day
+  -- regardless (shift-mix reporting in Monthly Overview); meaningless on a
+  -- leave/absence row, where nothing reads it. Not null -- the marker always
+  -- picks one when clocking in (pre-selected to 'morning', switchable).
+  shift_type       shift_type not null default 'morning',
   -- Populated by compute_attendance_hours() below whenever status = 'present'.
   -- worked_minutes is null until both time_in and time_out are set; a
   -- clock-in with no clock-out yet is treated as a full day for payroll
   -- purposes (day_fraction = 1.0) until/unless a clock-out is logged.
   worked_minutes    int,
   day_fraction      numeric(4,2),        -- this date's contribution to effective working days, capped at 1.00
-  overtime_fraction numeric(4,2) not null default 0,  -- anything worked beyond 8h, credited to that month's paid-leave balance
+  overtime_fraction numeric(4,2) not null default 0,  -- anything worked beyond this shift's full length, credited to that month's paid-leave balance at the standard 8h-equivalent rate
   locked_by_leave  boolean not null default false,
   marked_by        uuid references profiles(id),
   notes            text,
@@ -532,18 +540,27 @@ for each row execute function guard_attendance_write();
 --     member money, it just means the day isn't final yet.
 --   - Both times present: worked_minutes = time_out - time_in (must be
 --     positive -- a clock-out before clock-in is rejected outright).
---     day_fraction = least(worked_minutes / 480, 1.00), rounded to 2dp.
---     overtime_fraction = the leftover beyond 1.00 (also rounded to 2dp),
---     which paid_leave_balance() below adds straight into that month's
---     paid-leave balance -- exactly like the old manual overtime button
---     did, just computed instead of separately logged.
+--     The "full shift" length comes from shift_type: 12h (720 min) for
+--     'night', 8h (480 min) for 'morning'/'evening' -- this is what fixes a
+--     straight 12h night shift being miscounted as "8h + 0.5 overtime
+--     leave" when it's really just a regular full night-duty day.
+--     day_fraction = least(worked_minutes / shift_base, 1.00), rounded to 2dp.
+--     overtime_fraction = whatever's worked beyond that shift's own full
+--     length, converted to paid leave at the standard 8h-equivalent rate
+--     (not the shift's own base) -- e.g. 2h beyond a 12h night shift is
+--     2/8 = 0.25 day, same conversion rate as any other shift's overtime.
+--     This then feeds into paid_leave_balance() below exactly like the old
+--     manual overtime button did, just computed instead of separately logged.
 --   - Any other status (leave-synced, no-notice absent/half-day): these
 --     don't use clock times at all, so both fields are cleared/zeroed --
 --     effective_working_days() below uses its own fixed value for them.
 -- ============================================================================
 create or replace function compute_attendance_hours() returns trigger as $$
+declare
+  v_base_minutes int;
 begin
   if NEW.status = 'present' then
+    v_base_minutes := case when NEW.shift_type = 'night' then 720 else 480 end;
     if NEW.time_in is null or NEW.time_out is null then
       NEW.worked_minutes    := null;
       NEW.day_fraction      := 1.00;
@@ -557,8 +574,8 @@ begin
         -- the date duty started, rather than treating it as an error.
         NEW.worked_minutes := NEW.worked_minutes + 1440;
       end if;
-      NEW.day_fraction      := round(least(NEW.worked_minutes / 480.0, 1.0)::numeric, 2);
-      NEW.overtime_fraction := round(greatest(NEW.worked_minutes / 480.0 - 1.0, 0)::numeric, 2);
+      NEW.day_fraction      := round(least(NEW.worked_minutes::numeric / v_base_minutes, 1.0), 2);
+      NEW.overtime_fraction := round(greatest(NEW.worked_minutes - v_base_minutes, 0) / 480.0, 2);
     end if;
   else
     NEW.worked_minutes    := null;
