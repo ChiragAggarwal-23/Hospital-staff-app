@@ -53,6 +53,15 @@ function fmtDateNice(dstr) {
   return new Date(y, m - 1, d).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
+// "2026-10-13" + (-2) -> "2026-10-11". Used for the marker's rolling
+// 2-days-in-the-past edit window.
+function addDays(dstr, n) {
+  const [y, m, d] = dstr.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() + n);
+  return fmtDate(dt);
+}
+
 function monthRange(year, month) {
   const start = `${year}-${String(month).padStart(2, "0")}-01`;
   const lastDay = new Date(year, month, 0).getDate();
@@ -483,8 +492,25 @@ async function loadProfileAndRender() {
   }
   profile = data;
   if (!profile.role) { renderPendingScreen(); return; }
+  if (!profile.is_active) { renderDeactivatedScreen(); return; }
   activeTab = defaultTabForRole(profile.role);
   renderShell();
+}
+
+// Shown for an account the owner has permanently deactivated (laid off --
+// see the Staff Directory "Delete" action). Same shape as the pending
+// screen below: no tabs, nothing to do here but sign out.
+function renderDeactivatedScreen() {
+  app.innerHTML = `
+    <div class="login-wrap">
+      <div class="login-box">
+        <h1>Account deactivated</h1>
+        <p class="sub">Hi ${escapeHtml(profile.full_name)} — this account no longer has access.
+        If you think this is a mistake, reach out to the owner directly.</p>
+        <button class="btn btn-outline" id="deactivated-signout-btn" style="width:100%;">Sign out</button>
+      </div>
+    </div>`;
+  $("#deactivated-signout-btn").onclick = logout;
 }
 
 // Shown for a self-signed-up account the owner hasn't approved yet (no
@@ -562,7 +588,12 @@ async function openAccountModal() {
 // Shell: topbar + tabs + tab content
 // ----------------------------------------------------------------------------
 function tabsForRole(role) {
-  if (role === "marker") return [["mark", "Mark Attendance"], ["monthly", "Monthly Overview"]];
+  if (role === "marker") return [
+    ["mark", "Mark Attendance"],
+    ["monthly", "Monthly Overview"],
+    ["my-attendance", "My Attendance"],
+    ["approvals", "Approvals"],
+  ];
   if (role === "staff") return [["my-attendance", "My Attendance"], ["leave", "Leave Requests"]];
   return [
     ["approvals", "Approvals"],
@@ -624,12 +655,16 @@ function renderTabContent() {
 // ============================================================================
 async function renderDailyAttendance(el, { isOwner }) {
   let dateStr = el.dataset.date || todayStr();
+  // Marker: any future date, but only 2 days back. Owner: unrestricted.
+  const minDateStr = isOwner ? "" : addDays(todayStr(), -2);
+  const canEditDate = isOwner || dateStr >= minDateStr;
 
   el.innerHTML = `
     <div class="card">
       <h2>${isOwner ? "Attendance (owner override)" : "Mark Attendance"}</h2>
       <label>Date</label>
-      <input type="date" id="mark-date" value="${dateStr}" max="${isOwner ? "" : todayStr()}" />
+      <input type="date" id="mark-date" value="${dateStr}" ${minDateStr ? `min="${minDateStr}"` : ""} />
+      ${!canEditDate ? `<p class="hint-text">This date is more than 2 days in the past -- you can view it, but only the owner can change it now.</p>` : ""}
       <div id="staff-list" style="margin-top:14px;">Loading…</div>
     </div>
   `;
@@ -640,7 +675,7 @@ async function renderDailyAttendance(el, { isOwner }) {
   });
 
   const [{ data: staffList, error: staffErr }, { data: attendance }, { data: leaveDays }] = await Promise.all([
-    sb.from("profiles").select("id, full_name, employee_code").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
+    sb.from("profiles").select("id, full_name, employee_code").in("role", ["staff", "marker"]).eq("is_active", true).eq("is_test", false).order("full_name"),
     sb.from("attendance").select("staff_id, status, shift_type, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").eq("date", dateStr),
     sb.from("leave_request_days").select("staff_id, day_portion, type").eq("date", dateStr).eq("day_status", "active"),
   ]);
@@ -650,7 +685,6 @@ async function renderDailyAttendance(el, { isOwner }) {
 
   const attByStaff = Object.fromEntries((attendance || []).map((a) => [a.staff_id, a]));
   const leaveByStaff = Object.fromEntries((leaveDays || []).map((l) => [l.staff_id, l]));
-  const isFutureOrToday = dateStr >= todayStr();
 
   listEl.innerHTML = (staffList || []).map((s) => {
     const locked = leaveByStaff[s.id];
@@ -659,29 +693,38 @@ async function renderDailyAttendance(el, { isOwner }) {
     const isPresent = currentStatus === "present";
     let badgeHtml = `<span class="badge badge-none">Not marked</span>`;
     let actualLine = "";
+    let currentLabel = "";
     if (locked) {
       const b = leaveDayBadge(locked.day_portion, locked.type);
       badgeHtml = `<span class="badge ${b.cls}">${b.label}</span>`;
+      currentLabel = b.label;
     } else if (isPresent) {
       const p = presentInfo(att);
       const sl = shiftTypeLabel(att);
       badgeHtml = `<span class="badge ${p.cls}">${p.label}</span>${sl ? ` <span class="badge badge-none">${escapeHtml(sl)}</span>` : ""}`;
       const al = actualTimesLabel(att);
       if (al) actualLine = `<div class="hint-text" style="margin-top:2px;">${escapeHtml(al)}</div>`;
+      currentLabel = p.label;
     } else if (currentStatus) {
       const b = ATTENDANCE_LABELS[currentStatus];
       badgeHtml = `<span class="badge ${b.cls}">${b.label}</span>`;
+      currentLabel = b.label;
     }
 
-    const canEdit = !locked || isOwner;
+    // Owner: always editable. Marker: bounded to the 2-days-back/unlimited-
+    // future window above, same as everyone else on this page (one date
+    // per screen) -- a locked (leave) day no longer blocks the marker the
+    // way it used to; he can override/unmark it himself now too.
+    const canEdit = canEditDate;
     const showClockIn = canEdit && !isPresent;
     const showClockOut = canEdit && isPresent && att.time_in && !att.time_out;
     const showEditTimes = canEdit && isPresent && att.time_in;
-    const showUnmarkBtn = isOwner && locked && isFutureOrToday;
+    const showUnmarkBtn = canEdit && (locked || currentStatus);
     let actions = "";
     if (canEdit) {
       actions = `
         <div class="action-group" data-staff="${s.id}" data-name="${escapeHtml(s.full_name)}" data-locked="${locked ? "1" : ""}"
+             data-current-label="${escapeHtml(currentLabel)}"
              data-time-in="${att?.time_in || ""}" data-time-out="${att?.time_out || ""}"
              data-actual-time-in="${att?.actual_time_in || ""}" data-actual-time-out="${att?.actual_time_out || ""}"
              data-shift-type="${att?.shift_type || "morning"}">
@@ -693,7 +736,7 @@ async function renderDailyAttendance(el, { isOwner }) {
           <button class="btn btn-outline btn-small act-absent">Absent (No notice)</button>
           <button class="btn btn-outline btn-small act-paid">Log Paid Leave</button>
           <button class="btn btn-outline btn-small act-unpaid">Log Unpaid Leave</button>
-          ${showUnmarkBtn ? `<button class="btn btn-outline btn-small act-unmark">Cancel leave (leave unmarked)</button>` : ""}
+          ${showUnmarkBtn ? `<button class="btn btn-outline btn-small act-unmark">Unmark</button>` : ""}
         </div>`;
     }
 
@@ -720,6 +763,7 @@ async function renderDailyAttendance(el, { isOwner }) {
     const actualTimeIn = grp.dataset.actualTimeIn || null;
     const actualTimeOut = grp.dataset.actualTimeOut || null;
     const shiftType = grp.dataset.shiftType || "morning";
+    const currentLabel = grp.dataset.currentLabel || "";
     const btn = (sel) => $(sel, grp);
     if (btn(".act-clock-in")) btn(".act-clock-in").onclick = () => confirmedClockIn(staffId, staffName, dateStr, el, isOwner, wasLocked);
     if (btn(".act-clock-out")) btn(".act-clock-out").onclick = () => handleClockOut(staffId, staffName, dateStr, el, isOwner, timeIn, actualTimeIn);
@@ -728,19 +772,21 @@ async function renderDailyAttendance(el, { isOwner }) {
     if (btn(".act-absent")) btn(".act-absent").onclick = () => confirmedMarkAttendance(staffId, staffName, "absent_no_notice", dateStr, el, isOwner, wasLocked);
     if (btn(".act-paid")) btn(".act-paid").onclick = () => confirmedLogLeave(staffId, staffName, dateStr, "paid", isOwner, el, wasLocked);
     if (btn(".act-unpaid")) btn(".act-unpaid").onclick = () => confirmedLogLeave(staffId, staffName, dateStr, "unpaid", isOwner, el, wasLocked);
-    if (btn(".act-unmark")) btn(".act-unmark").onclick = () => confirmedCancelUnmark(staffId, staffName, dateStr, el, isOwner);
+    if (btn(".act-unmark")) btn(".act-unmark").onclick = () => confirmedUnmark(staffId, staffName, dateStr, el, isOwner, wasLocked, currentLabel);
   });
 }
 
-// Wrap the override actions with a confirmation whenever they'd be
-// cancelling an existing approved leave (misclick protection) -- routine
-// marking on an already-open date proceeds straight through, unchanged.
+// Half-day/Absent (No notice) are one click with no other input, so --
+// unlike clock-in/out (asks for a time) or leave (asks for a reason) --
+// they're the ones that actually get misclicked. Always confirm, whether
+// or not it's also cancelling an existing approved leave.
 async function confirmedMarkAttendance(staffId, staffName, status, dateStr, el, isOwner, wasLocked) {
-  if (wasLocked) {
-    const label = ATTENDANCE_LABELS[status].label;
-    const ok = await confirmAction(`This will cancel ${staffName}'s approved leave on ${fmtDateNice(dateStr)} and mark them "${label}" instead. Continue?`);
-    if (!ok) return;
-  }
+  const label = ATTENDANCE_LABELS[status].label;
+  const msg = wasLocked
+    ? `This will cancel ${staffName}'s approved leave on ${fmtDateNice(dateStr)} and mark them "${label}" instead. Continue?`
+    : `Mark ${staffName} as "${label}" on ${fmtDateNice(dateStr)}? (You can undo this afterward with "Unmark".)`;
+  const ok = await confirmAction(msg);
+  if (!ok) return;
   await markSimpleAttendance(staffId, status, dateStr, el, isOwner, wasLocked);
 }
 
@@ -752,19 +798,32 @@ async function confirmedLogLeave(staffId, staffName, dateStr, type, isOwner, el,
   await logLeaveQuick(staffId, staffName, dateStr, type, isOwner, el, wasLocked);
 }
 
-async function confirmedCancelUnmark(staffId, staffName, dateStr, el, isOwner) {
-  const ok = await confirmAction(`This will cancel ${staffName}'s approved leave on ${fmtDateNice(dateStr)} and leave the day unmarked. Continue?`);
+// Reverts a day back to "Not marked" -- whatever it currently is. A
+// leave-locked day gets cancelled (restoring the balance, same path as an
+// override); anything else (present/absent/half-day, no lock involved) is
+// just removed from attendance outright. Always confirms first -- this is
+// itself an easy thing to misclick, same as any of the one-click buttons.
+async function confirmedUnmark(staffId, staffName, dateStr, el, isOwner, locked, currentLabel) {
+  const ok = await confirmAction(
+    `This will remove "${currentLabel}" for ${staffName} on ${fmtDateNice(dateStr)} and leave the day unmarked` +
+    `${locked ? " (their leave balance will be restored)" : ""}. Continue?`
+  );
   if (!ok) return;
-  const done = await cancelLockedLeaveDay(staffId, dateStr);
-  if (!done) return;
+  if (locked) {
+    const done = await cancelLockedLeaveDay(staffId, dateStr);
+    if (!done) return;
+  } else {
+    const { error } = await sb.from("attendance").delete().eq("staff_id", staffId).eq("date", dateStr);
+    if (error) { alert("Couldn't unmark: " + error.message); return; }
+  }
   renderDailyAttendance(el, { isOwner });
 }
 
-// When the owner overrides a date that's currently locked by an approved
-// leave day, cancel that leave day first: this restores the staff's paid
-// leave balance (if it was paid) and unlocks the date, via the same
-// trigger path used for ordinary leave cancellation. Marker never reaches
-// here -- locked dates aren't editable by marker at all (see `canEdit`).
+// When the owner or marker overrides a date that's currently locked by an
+// approved leave day, cancel that leave day first: this restores the
+// staff's paid leave balance (if it was paid) and unlocks the date, via
+// the same trigger path used for ordinary leave cancellation. Marker's
+// own date-range limits are enforced in the database (RLS), not here.
 async function cancelLockedLeaveDay(staffId, dateStr) {
   const { error } = await sb
     .from("leave_request_days")
@@ -976,7 +1035,7 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
   $("#mo-month", body).addEventListener("change", rerender);
 
   const [{ data: staffList, error: staffErr }, { data: att }] = await Promise.all([
-    sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name"),
+    sb.from("profiles").select("id, full_name").in("role", ["staff", "marker"]).eq("is_active", true).eq("is_test", false).order("full_name"),
     sb.from("attendance").select("staff_id, date, status, shift_type, time_in, time_out, actual_time_in, actual_time_out, worked_minutes, day_fraction, overtime_fraction").gte("date", start).lte("date", end),
   ]);
 
@@ -1052,10 +1111,21 @@ async function renderMonthlyOverview(body, parentEl, opts = {}) {
 //                 "none"  -- marker viewing someone else (no salary, no
 //                             balance -- only attendance + effective days)
 // ============================================================================
-async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, onBack }) {
+async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, onBack, restrictMonths = false }) {
   const now = new Date();
   let year = parseInt(el.dataset.year || now.getFullYear(), 10);
   let month = parseInt(el.dataset.month || now.getMonth() + 1, 10);
+
+  // Staff only ever get the current month and the one before it (e.g. on
+  // 1st Nov, only Oct and Nov -- not Sept or earlier). Owner and marker
+  // viewing anyone (including a marker viewing their own) are unrestricted.
+  const curY = now.getFullYear(), curM = now.getMonth() + 1;
+  let prevY = curY, prevM = curM - 1;
+  if (prevM < 1) { prevM = 12; prevY -= 1; }
+  if (restrictMonths) {
+    const withinWindow = (y, m) => (y === curY && m === curM) || (y === prevY && m === prevM);
+    if (!withinWindow(year, month)) { year = curY; month = curM; }
+  }
   el.dataset.year = year;
   el.dataset.month = month;
 
@@ -1088,6 +1158,9 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
 
   const shiftCounts = { morning: 0, evening: 0, night: 0 };
   (att || []).forEach((a) => { if (a.status === "present") shiftCounts[a.shift_type] = (shiftCounts[a.shift_type] || 0) + 1; });
+
+  const atMin = restrictMonths && year === prevY && month === prevM;
+  const atMax = restrictMonths && year === curY && month === curM;
 
   let cells = "";
   for (let i = 0; i < firstWeekday; i++) cells += `<div></div>`;
@@ -1132,14 +1205,15 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
       ${balErr ? `<div class="error-text">${escapeHtml(balErr.message)}</div>` : ""}
     </div>
     <div class="card">
+      ${restrictMonths ? `<div class="hint-text" style="margin-bottom:10px;">You can view the current month and the one before it.</div>` : `
       <div class="row" style="margin-bottom:10px;">
         <div><label>Month</label>${monthSelectHtml("cal-month", month)}</div>
         <div><label>Year</label><input type="number" id="cal-year" value="${year}" /></div>
-      </div>
+      </div>`}
       <div class="staff-row" style="border-bottom:none; padding-top:0;">
-        <button class="btn btn-outline btn-small" id="prev-month">&larr; Prev</button>
+        <button class="btn btn-outline btn-small" id="prev-month" ${atMin ? "disabled" : ""}>&larr; Prev</button>
         <h2 style="margin:0;">${monthLabel}</h2>
-        <button class="btn btn-outline btn-small" id="next-month">Next &rarr;</button>
+        <button class="btn btn-outline btn-small" id="next-month" ${atMax ? "disabled" : ""}>Next &rarr;</button>
       </div>
       <div class="calendar-grid">${cells}</div>
     </div>
@@ -1150,12 +1224,12 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
 
   function goTo(y, m) {
     el.dataset.year = y; el.dataset.month = m;
-    renderPersonalCalendar(el, { staffId, staffName, salaryAccess, onBack });
+    renderPersonalCalendar(el, { staffId, staffName, salaryAccess, onBack, restrictMonths });
   }
   $("#prev-month", el).onclick = () => { let m = month - 1, y = year; if (m < 1) { m = 12; y -= 1; } goTo(y, m); };
   $("#next-month", el).onclick = () => { let m = month + 1, y = year; if (m > 12) { m = 1; y += 1; } goTo(y, m); };
-  $("#cal-month", el).onchange = (e) => goTo(year, parseInt(e.target.value, 10));
-  $("#cal-year", el).onchange = (e) => goTo(parseInt(e.target.value, 10), month);
+  if ($("#cal-month", el)) $("#cal-month", el).onchange = (e) => goTo(year, parseInt(e.target.value, 10));
+  if ($("#cal-year", el)) $("#cal-year", el).onchange = (e) => goTo(parseInt(e.target.value, 10), month);
 }
 
 // ============================================================================
@@ -1163,7 +1237,15 @@ async function renderPersonalCalendar(el, { staffId, staffName, salaryAccess, on
 // around the shared personal-calendar renderer.
 // ============================================================================
 function renderMyAttendanceTab(el) {
-  return renderPersonalCalendar(el, { staffId: profile.id, staffName: null, salaryAccess: "self", onBack: null });
+  // Shared by staff's own "My Attendance" tab and marker's own (he marks
+  // his own attendance from the Mark Attendance screen, but sees his own
+  // balance/salary here, same as a staff member would). Only staff gets
+  // the current+previous-month-only restriction -- owner and marker can
+  // always see every month, including this same tab for the marker's own.
+  return renderPersonalCalendar(el, {
+    staffId: profile.id, staffName: null, salaryAccess: "self", onBack: null,
+    restrictMonths: profile.role === "staff",
+  });
 }
 
 function cssVarFromClass(cls) {
@@ -1614,6 +1696,9 @@ async function renderStaffSalaryTab(el) {
 
   if (error) { container.innerHTML = `<div class="error-text">${escapeHtml(error.message)}</div>`; return; }
 
+  // Delete (permanently deactivate) is only offered for active staff rows
+  // -- not for the owner's own row, not for the marker, and not for
+  // someone already deactivated (nothing left to do there).
   container.innerHTML = (data || []).map((s) => `
     <div class="staff-row">
       <div>
@@ -1624,8 +1709,30 @@ async function renderStaffSalaryTab(el) {
         <input type="number" step="0.01" class="salary-input" data-staff="${s.id}" style="width:120px;"
           value="${s.staff_salary?.monthly_salary ?? ""}" placeholder="Monthly salary" />
         <button class="btn btn-primary btn-small act-save-salary" data-staff="${s.id}">Save</button>
+        ${s.role === "staff" && s.is_active ? `<button class="btn btn-danger btn-small act-delete-staff" data-staff="${s.id}" data-name="${escapeHtml(s.full_name)}">Delete</button>` : ""}
       </div>
     </div>`).join("");
+
+  $all(".act-delete-staff", container).forEach((btn) => {
+    btn.onclick = async () => {
+      const staffId = btn.dataset.staff;
+      const staffName = btn.dataset.name;
+      const ok1 = await confirmAction(
+        `Remove ${staffName} from the app? They'll disappear from every list immediately and won't be able to sign in again. ` +
+        `Their past attendance, salary, and leave history is kept for your records. Continue?`,
+        "Yes, continue"
+      );
+      if (!ok1) return;
+      const ok2 = await confirmAction(
+        `Are you sure? This can only be undone by asking for it to be reversed in the database -- there's no "undo" button in the app. Delete ${staffName}?`,
+        "Yes, delete"
+      );
+      if (!ok2) return;
+      const { error } = await sb.from("profiles").update({ is_active: false }).eq("id", staffId);
+      if (error) { alert("Couldn't delete: " + error.message); return; }
+      renderStaffSalaryTab(el);
+    };
+  });
 
   $all(".act-save-salary", container).forEach((btn) => {
     btn.onclick = async () => {
@@ -1672,7 +1779,7 @@ async function renderPayrollTab(el) {
 
   const tableEl = $("#pr-table", el);
   const { data: staffList, error: staffErr } = await sb
-    .from("profiles").select("id, full_name").eq("role", "staff").eq("is_active", true).eq("is_test", false).order("full_name");
+    .from("profiles").select("id, full_name").in("role", ["staff", "marker"]).eq("is_active", true).eq("is_test", false).order("full_name");
   if (staffErr) { tableEl.innerHTML = `<div class="error-text">${escapeHtml(staffErr.message)}</div>`; return; }
   if (!staffList || staffList.length === 0) { tableEl.innerHTML = `<div class="hint-text">No active staff yet.</div>`; return; }
 
@@ -1711,7 +1818,7 @@ async function renderPayrollTab(el) {
 // OWNER: Balance Adjustments tab
 // ============================================================================
 async function renderAdjustmentsTab(el) {
-  const { data: staffList } = await sb.from("profiles").select("id, full_name").eq("role", "staff").eq("is_test", false).order("full_name");
+  const { data: staffList } = await sb.from("profiles").select("id, full_name").in("role", ["staff", "marker"]).eq("is_test", false).order("full_name");
 
   el.innerHTML = `
     <div class="card">

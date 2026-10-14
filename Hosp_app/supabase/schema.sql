@@ -45,8 +45,14 @@ create table profiles (
   department    text,
   designation   text,
   join_date     date,
+  -- Also doubles as "permanently deactivated" (laid off): the owner's
+  -- Staff Directory "Delete" action just sets this false. A deactivated
+  -- account disappears from every active list and can't sign back in
+  -- (see the app's post-login gate), but its attendance/salary/leave
+  -- history is left untouched for payroll records.
   is_active     boolean not null default true,
   is_test       boolean not null default false,  -- excluded from every staff-listing view (Staff Directory, Attendance, Payroll, ...) but otherwise fully functional -- for the developer's own ongoing testing, invisible to real users
+  paid_leave_override numeric,  -- overrides the usual 2/month paid-leave accrual for this one person specifically (null = standard default)
   created_at    timestamptz not null default now()
 );
 
@@ -215,7 +221,8 @@ $$ language sql stable security definer;
 
 -- The core payroll number: how many paid-leave days does this staff member
 -- have left for this specific month.
---   = base 2/month
+--   = base 2/month (or that person's own paid_leave_override, if set --
+--     e.g. a longtime marker gets 3)
 --   + every fraction of a day worked beyond 8h this month (auto-detected
 --     from clock-in/clock-out times -- see compute_attendance_hours())
 --   + any manual owner adjustment for this month
@@ -224,11 +231,13 @@ $$ language sql stable security definer;
 --     submitted close together can't both assume the full balance)
 create or replace function paid_leave_balance(p_staff_id uuid, p_year int, p_month int) returns numeric as $$
 declare
-  base           numeric := 2.0;
+  base           numeric;
   overtime_bonus numeric;
   adjustments    numeric;
   consumed       numeric;
 begin
+  select coalesce(paid_leave_override, 2.0) into base from profiles where id = p_staff_id;
+
   select coalesce(sum(overtime_fraction), 0) into overtime_bonus
   from attendance
   where staff_id = p_staff_id
@@ -642,11 +651,11 @@ $$ language plpgsql stable security definer;
 -- unused paid-leave balance is added on top of effective days -- an
 -- employee who worked every day AND still has paid leave left over is
 -- paid for (effective_days + balance) days out of the month, not just
--- effective_days alone. Owner can compute for anyone; a staff member
--- only for themself (the app only surfaces this once the viewed month
--- has fully ended -- enforced client-side, not here, since a staff
--- member checking their own in-progress-month number isn't a security
--- issue, just not a meaningful one yet). Marker never gets access.
+-- effective_days alone. Owner can compute for anyone; anyone else
+-- (staff or marker) only for themself (the app only surfaces this once
+-- the viewed month has fully ended -- enforced client-side, not here,
+-- since checking your own in-progress-month number isn't a security
+-- issue, just not a meaningful one yet).
 create or replace function calculate_salary(p_staff_id uuid, p_year int, p_month int) returns numeric as $$
 declare
   v_salary  numeric;
@@ -655,9 +664,6 @@ declare
   v_bal     numeric;
 begin
   if not (app_role() = 'owner' or p_staff_id = auth.uid()) then
-    raise exception 'Not permitted.';
-  end if;
-  if app_role() = 'marker' then
     raise exception 'Not permitted.';
   end if;
 
@@ -867,7 +873,10 @@ create policy "marker_read_profiles" on profiles for select
 create policy "staff_read_own_profile" on profiles for select
   using (id = auth.uid());
 
--- staff_salary -- no marker policy at all, on purpose ------------------------
+-- staff_salary -- owner sees everyone's; this policy is ownership-based,
+-- not role-based, so it already covers a marker reading their own row too
+-- (needed now that a marker accrues salary and can see their own figures --
+-- calculate_salary() above is what actually gates it being anyone else's).
 create policy "owner_all_salary" on staff_salary for all
   using (app_role() = 'owner');
 
@@ -881,11 +890,19 @@ create policy "owner_all_attendance" on attendance for all
 create policy "marker_read_attendance" on attendance for select
   using (app_role() = 'marker');
 
+-- Marker can mark/edit any future date, but only up to 2 days in the past
+-- (today, yesterday, the day before -- enough for a late clock-out or a
+-- same-week correction, not enough to go back and rewrite old history).
 create policy "marker_write_attendance" on attendance for insert
-  with check (app_role() = 'marker');
+  with check (app_role() = 'marker' and date >= current_date - 2);
 
 create policy "marker_update_attendance" on attendance for update
-  using (app_role() = 'marker');
+  using (app_role() = 'marker' and date >= current_date - 2);
+
+-- Needed for the "Unmark" action (revert a plain attendance row back to
+-- "not marked"), same date bound as writing/editing.
+create policy "marker_delete_attendance" on attendance for delete
+  using (app_role() = 'marker' and date >= current_date - 2);
 
 create policy "staff_read_own_attendance" on attendance for select
   using (staff_id = auth.uid());
@@ -900,6 +917,13 @@ create policy "staff_read_own_adjustments" on leave_balance_adjustments for sele
 -- leave_requests -----------------------------------------------------------
 create policy "owner_all_leave_requests" on leave_requests for all
   using (app_role() = 'owner');
+
+-- Marker gets the same complete access as owner (approve/reject/alter any
+-- request, no date bound) -- the marker is trusted the same as the owner
+-- for the Approvals tab. This supersedes the narrower read-only/same-day
+-- policies below, which stay in place but become redundant for marker.
+create policy "marker_all_leave_requests" on leave_requests for all
+  using (app_role() = 'marker');
 
 create policy "marker_read_leave_requests" on leave_requests for select
   using (app_role() = 'marker');
@@ -935,6 +959,12 @@ create policy "marker_log_leave_request" on leave_requests for insert
 create policy "owner_all_leave_days" on leave_request_days for all
   using (app_role() = 'owner');
 
+-- Same "full access, same as owner" extension as leave_requests above --
+-- lets marker cancel/shorten an approved leave day themself (the "Unmark"
+-- action), not just read it.
+create policy "marker_all_leave_days" on leave_request_days for all
+  using (app_role() = 'marker');
+
 create policy "marker_read_leave_days" on leave_request_days for select
   using (app_role() = 'marker');
 
@@ -946,9 +976,12 @@ create policy "staff_update_own_leave_days" on leave_request_days for update
   -- fine-grained validation (future dates only, cancel-or-shorten only,
   -- never on an owner-overridden row) happens in trg_guard_leave_day_edit
 
--- notifications -- owner-only, front to back ---------------------------------
+-- notifications -- owner + marker, same full access ---------------------------
 create policy "owner_all_notifications" on notifications for all
   using (app_role() = 'owner');
+
+create policy "marker_all_notifications" on notifications for all
+  using (app_role() = 'marker');
 
 -- ============================================================================
 -- Notifications housekeeping: auto-delete old notifications so the
