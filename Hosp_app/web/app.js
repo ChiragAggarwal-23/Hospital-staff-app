@@ -1346,42 +1346,19 @@ async function loadMyRequests() {
           const badge = d.day_status === "cancelled"
             ? `<span class="badge badge-cancelled">Cancelled</span>`
             : (() => { const b = leaveDayBadge(d.day_portion, d.type); return `<span class="badge ${b.cls}">${b.label}</span>`; })();
-          const future = d.date > todayStr();
-          const canAct = r.status === "approved" && d.day_status === "active" && future;
           return `
             <div class="day-line" data-day-id="${d.id}" data-portion="${d.day_portion}" data-date="${d.date}">
               <span>${fmtDateNice(d.date)}</span>
               <span style="display:flex; gap:6px; align-items:center;">
                 ${badge}
-                ${canAct ? `<button class="btn btn-outline btn-small act-cancel-day">Cancel</button>` : ""}
-                ${canAct && d.day_portion === "full" ? `<button class="btn btn-outline btn-small act-shorten-day">Shorten to half-day</button>` : ""}
               </span>
             </div>`;
         }).join("")}
+        ${r.status === "approved" ? `<div class="hint-text" style="margin-top:6px;">To change or cancel an approved leave day, ask the marker or owner.</div>` : ""}
         ${r.status === "pending" ? `<div style="margin-top:8px;"><button class="btn btn-outline btn-small act-withdraw" data-req-id="${r.id}">Withdraw request</button></div>` : ""}
       </div>`;
   }).join("");
 
-  $all(".act-cancel-day", container).forEach((btn) => {
-    btn.onclick = async () => {
-      const line = btn.closest(".day-line");
-      const ok = await confirmAction(`Cancel your approved leave for ${fmtDateNice(line.dataset.date)}?`);
-      if (!ok) return;
-      const { error } = await sb.from("leave_request_days").update({ day_status: "cancelled" }).eq("id", line.dataset.dayId);
-      if (error) { alert("Couldn't cancel: " + error.message); return; }
-      await loadMyRequests();
-    };
-  });
-  $all(".act-shorten-day", container).forEach((btn) => {
-    btn.onclick = async () => {
-      const line = btn.closest(".day-line");
-      const ok = await confirmAction(`Shorten your approved leave for ${fmtDateNice(line.dataset.date)} to a half-day?`);
-      if (!ok) return;
-      const { error } = await sb.from("leave_request_days").update({ day_portion: "half" }).eq("id", line.dataset.dayId);
-      if (error) { alert("Couldn't update: " + error.message); return; }
-      await loadMyRequests();
-    };
-  });
   $all(".act-withdraw", container).forEach((btn) => {
     btn.onclick = async () => {
       const { error } = await sb.from("leave_requests").update({ status: "cancelled" }).eq("id", btn.dataset.reqId);

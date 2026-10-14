@@ -433,12 +433,15 @@ for each row execute function cascade_cancel_request_days();
 -- ============================================================================
 
 -- Validates who is allowed to change what, on which dates.
---   owner : unrestricted, any date, any change -- and marks it overridden
---           so later auto-recalculation never touches it again.
---   staff : only their own row, only a strictly-future date, only if it
---           hasn't already been owner-overridden, and only two possible
---           edits: cancel it, or shorten a full day down to a half day.
---   marker: no update policy on this table at all -- blocked outright.
+--   owner, marker: unrestricted, any date, any change -- and marks it
+--                   overridden so later auto-recalculation never touches
+--                   it again. Marker is trusted the same as owner here
+--                   (same as the rest of the Approvals tab).
+--   staff: no access at all -- if they want an approved leave day
+--          changed, they ask the marker or owner to do it. (Withdrawing a
+--          still-PENDING request is a separate, unaffected path --
+--          leave_requests.staff_cancel_pending_request -- since nothing
+--          is locked yet at that stage.)
 create or replace function guard_leave_day_edit() returns trigger as $$
 declare
   actor_role user_role;
@@ -449,32 +452,9 @@ begin
 
   select role into actor_role from profiles where id = auth.uid();
 
-  if actor_role = 'owner' then
+  if actor_role in ('owner', 'marker') then
     NEW.owner_overridden := true;
     return NEW;
-  end if;
-
-  if actor_role = 'staff' then
-    if OLD.staff_id <> auth.uid() then
-      raise exception 'Not your leave record.';
-    end if;
-    if OLD.date <= current_date then
-      raise exception 'This date has already passed and can only be changed by the owner.';
-    end if;
-    if OLD.owner_overridden then
-      raise exception 'This entry was manually set by the owner and can no longer be self-edited.';
-    end if;
-
-    if NEW.day_status = 'cancelled' and OLD.day_status = 'active' then
-      NEW.cancelled_at := now();
-      NEW.cancelled_by := auth.uid();
-      return NEW;
-    elsif NEW.day_portion = 'half' and OLD.day_portion = 'full'
-          and NEW.day_status = 'active' and OLD.day_status = 'active' then
-      return NEW;
-    else
-      raise exception 'You may only cancel a future leave day, or shorten a full day to a half day.';
-    end if;
   end if;
 
   raise exception 'Not permitted.';
@@ -971,10 +951,9 @@ create policy "marker_read_leave_days" on leave_request_days for select
 create policy "staff_read_own_leave_days" on leave_request_days for select
   using (staff_id = auth.uid());
 
-create policy "staff_update_own_leave_days" on leave_request_days for update
-  using (staff_id = auth.uid());
-  -- fine-grained validation (future dates only, cancel-or-shorten only,
-  -- never on an owner-overridden row) happens in trg_guard_leave_day_edit
+-- Staff has no write policy here at all -- can't cancel or shorten their
+-- own approved leave. (Also enforced at the trigger level in
+-- guard_leave_day_edit, which blocks anyone who isn't owner/marker.)
 
 -- notifications -- owner + marker, same full access ---------------------------
 create policy "owner_all_notifications" on notifications for all
