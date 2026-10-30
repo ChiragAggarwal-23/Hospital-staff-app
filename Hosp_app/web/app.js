@@ -655,8 +655,9 @@ function renderTabContent() {
 // ============================================================================
 async function renderDailyAttendance(el, { isOwner }) {
   let dateStr = el.dataset.date || todayStr();
-  // Marker: any future date, but only 2 days back. Owner: unrestricted.
-  const minDateStr = isOwner ? "" : addDays(todayStr(), -2);
+  // Marker: any future date, but only 40 days back (temporarily widened
+  // from 2, to backfill October while testing). Owner: unrestricted.
+  const minDateStr = isOwner ? "" : addDays(todayStr(), -40);
   const canEditDate = isOwner || dateStr >= minDateStr;
 
   el.innerHTML = `
@@ -664,7 +665,7 @@ async function renderDailyAttendance(el, { isOwner }) {
       <h2>${isOwner ? "Attendance (owner override)" : "Mark Attendance"}</h2>
       <label>Date</label>
       <input type="date" id="mark-date" value="${dateStr}" ${minDateStr ? `min="${minDateStr}"` : ""} />
-      ${!canEditDate ? `<p class="hint-text">This date is more than 2 days in the past -- you can view it, but only the owner can change it now.</p>` : ""}
+      ${!canEditDate ? `<p class="hint-text">This date is more than 40 days in the past -- you can view it, but only the owner can change it now.</p>` : ""}
       <div id="staff-list" style="margin-top:14px;">Loading…</div>
     </div>
   `;

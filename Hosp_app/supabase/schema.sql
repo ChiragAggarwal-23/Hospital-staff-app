@@ -870,19 +870,19 @@ create policy "owner_all_attendance" on attendance for all
 create policy "marker_read_attendance" on attendance for select
   using (app_role() = 'marker');
 
--- Marker can mark/edit any future date, but only up to 2 days in the past
--- (today, yesterday, the day before -- enough for a late clock-out or a
--- same-week correction, not enough to go back and rewrite old history).
+-- Marker can mark/edit any future date, but only up to 40 days in the past
+-- (temporarily widened from 2, per migration_12, to backfill October while
+-- testing -- tighten this back down once backfilling is done).
 create policy "marker_write_attendance" on attendance for insert
-  with check (app_role() = 'marker' and date >= current_date - 2);
+  with check (app_role() = 'marker' and date >= current_date - 40);
 
 create policy "marker_update_attendance" on attendance for update
-  using (app_role() = 'marker' and date >= current_date - 2);
+  using (app_role() = 'marker' and date >= current_date - 40);
 
 -- Needed for the "Unmark" action (revert a plain attendance row back to
 -- "not marked"), same date bound as writing/editing.
 create policy "marker_delete_attendance" on attendance for delete
-  using (app_role() = 'marker' and date >= current_date - 2);
+  using (app_role() = 'marker' and date >= current_date - 40);
 
 create policy "staff_read_own_attendance" on attendance for select
   using (staff_id = auth.uid());
